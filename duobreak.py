@@ -285,7 +285,7 @@ class DuoAuthenticator:
         return auth
 
     def get_transactions(self, key_config):
-        dt = datetime.datetime.utcnow()
+        dt = datetime.datetime.now(datetime.timezone.utc)
         time = email.utils.format_datetime(dt)
         path = "/push/v2/device/transactions"
 
@@ -309,7 +309,7 @@ class DuoAuthenticator:
         return r.json()
 
     def reply_transaction(self, transaction_id, answer, key_config):
-        dt = datetime.datetime.utcnow()
+        dt = datetime.datetime.now(datetime.timezone.utc)
         time = email.utils.format_datetime(dt)
         path = "/push/v2/device/transactions/" + transaction_id
 
@@ -413,7 +413,7 @@ class DuoAuthenticator:
                 hotp_code = hotp.at(self.config["keys"][key_name]["hotp_counter"])
                 print(f"Generated HOTP code: {hotp_code}")
 
-                self.config["keys"][key_name]["hotp_log"].append(f"{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} ({key_name}): {hotp_code}")
+                self.config["keys"][key_name]["hotp_log"].append(f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} ({key_name}): {hotp_code}")
                 self.save_config()
             elif auth_method == "3":
                 self.show_recent_hotp_codes(key_name)
