@@ -1,254 +1,465 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Version: 1.2.0
+# Version: 2.0.0
 # For security updates, visit github.com/JesseNaser/DuoBreak
 
-from Crypto.Cipher import AES
-from Crypto.Hash import SHA512
-from Crypto.PublicKey import RSA
-from Crypto.Signature import pkcs1_15
-from Crypto.Util.Padding import pad, unpad
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from PIL import Image
-from pyzbar.pyzbar import decode as pyzbar_decode
-import atexit
 import base64
 import datetime
 import email.utils
 import getpass
 import json
-import logging
 import os
-import pyotp
-import requests
-import shutil
-import sys
+from pathlib import Path
+import re
+import tempfile
 import time
 import urllib.parse
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
-VERIFY_SSL = True
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256, SHA512
+from Crypto.Protocol.KDF import PBKDF2, scrypt
+from Crypto.PublicKey import RSA
+from Crypto.Random import get_random_bytes
+from Crypto.Signature import pkcs1_15
+from Crypto.Util.Padding import unpad
+from PIL import Image
+import pyotp
+from pyzbar.pyzbar import decode as pyzbar_decode
+import requests
+
+
+DB_V1 = b"DBv1"
+DB_V2 = b"DBv2"
+SALT_SIZE = NONCE_SIZE = TAG_SIZE = 16
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**17, 8, 1
+REQUEST_TIMEOUT = (5, 30)
+POLL_SECONDS = 5
 
 
 class DuoAuthenticator:
     def __init__(self, config_file=None):
-        self.config_file = config_file
-        self.config_version = 1
+        self.config_file = Path(config_file) if config_file else None
         self.config = {}
+        self.salt = None
         self.encryption_key = None
-        self.select_database()
-        self.load_config()
-
-        if "keys" not in self.config:
-            self.config["keys"] = {}
-            self.save_config()
-
-    def derive_encryption_key(self, password, salt=None):
-        if salt is None:
-            salt = os.urandom(16)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-            backend=default_backend()
-        )
-        return salt, kdf.derive(password.encode("utf-8"))
-
-    def verify_encryption_key(self, key, password, salt):
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-            backend=default_backend()
-        )
-        try:
-            kdf.verify(password.encode("utf-8"), key)
-            return True
-        except Exception:
-            return False
-
-    def encrypt_data(self, data, key):
-        cipher = AES.new(key, AES.MODE_CBC)
-        return cipher.iv + cipher.encrypt(pad(data, AES.block_size))
-
-    def decrypt_data(self, encrypted_data, key):
-        iv = encrypted_data[:AES.block_size]
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        return unpad(cipher.decrypt(encrypted_data[AES.block_size:]), AES.block_size)
-
-    def get_password(self, prompt):
-        password = getpass.getpass(prompt)
-        if len(password) < 8:
-            logger.error("Password must be at least 8 characters long.")
-            return self.get_password(prompt)
-        return password
-
-    def confirm_password(self, prompt):
-        password = self.get_password(prompt)
-        password_confirm = self.get_password("Confirm password: ")
-        if password == password_confirm:
-            return password
-        else:
-            print("Passwords do not match. Please try again.")
-            return self.confirm_password(prompt)
-
-    def select_database(self):
-        duo_files = [f for f in os.listdir() if f.endswith(".duo")]
-        if duo_files:
-            print("Duo databases found:")
-            for i, file in enumerate(duo_files, 1):
-                print(f"{i}. {file}")
-            while True:
-                try:
-                    choice = int(input("Enter the number corresponding to the database you want to use: "))
-                    if 1 <= choice <= len(duo_files):
-                        self.config_file = duo_files[choice - 1]
-                        break
-                    else:
-                        print("Invalid input. Please enter a valid number.")
-                except ValueError:
-                    print("Invalid input. Please enter a valid number.")
-        else:
-            print("No Duo databases found. Creating a new database.")
-            db_name = input("Enter a name for the new database: ").strip()
-            self.config_file = f"{db_name}.duo"
-
-    def change_password(self):
-        password = self.confirm_password("Enter a new password for the database: ")
-        salt, new_key = self.derive_encryption_key(password)
-        decrypted_data = self.decrypt_data(self.config["encrypted_data"], self.encryption_key)
-        self.config["encrypted_data"] = self.encrypt_data(decrypted_data, new_key)
-        self.encryption_key = new_key
-        self.save_config(salt=salt)  # Make sure that the salt is passed as a keyword argument
-        print("Password changed successfully.")
-
-    def load_config(self):
-        attempts = 0
-        while attempts < 3:
-            if os.path.exists(self.config_file):
-                print("Ready for password input.")
-                password = self.get_password("Enter the password to unlock your vault: ")
-                with open(self.config_file, "rb") as f:
-                    version, salt, encrypted_data = f.read(4), f.read(16), f.read()
-                    if version != b"DBv1":
-                        logger.error("Unsupported configuration file version. Exiting...")
-                        sys.exit(1)
-
-                    self.encryption_key = self.derive_encryption_key(password, salt)[1]
-                    if self.verify_encryption_key(self.encryption_key, password, salt):
-                        try:
-                            self.config["encrypted_data"] = encrypted_data
-                            decrypted_data = self.decrypt_data(encrypted_data, self.encryption_key)
-                            self.config.update(json.loads(decrypted_data))
-                            break
-                        except ValueError as e:
-                            logger.error("Incorrect password or corrupted data. Please try again.")
-                            attempts += 1
-                    else:
-                        logger.error("Incorrect password. Please try again.")
-                        attempts += 1
-            else:
-                print("Ready for password input.")
-                password = self.confirm_password("Enter a password to create a new vault: ")
-                salt, self.encryption_key = self.derive_encryption_key(password)
-                self.config = {"keys": {}}
-                self.save_config(salt)
-        if attempts >= 3:
-            logger.error("Reached maximum password attempts. Exiting...")
-            sys.exit(1)
-
-    def import_key(self, keyfile):
-        try:
-            self.pubkey = RSA.import_key(keyfile.encode("utf-8"))
-        except ValueError:
-            with open(keyfile, "rb") as f:
-                self.pubkey = RSA.import_key(f.read())
-
-    def save_config(self, salt=None):
-        if salt is None:
-            with open(self.config_file, "rb") as f:
-                version, salt = f.read(4), f.read(16)
-
-        # Temporarily remove the "encrypted_data" key from the config dictionary, if it exists
-        encrypted_data = self.config.pop("encrypted_data", None)
-
-        # Save the config dictionary without the "encrypted_data" key to a temporary file
-        temp_file = self.config_file + ".tmp"
-        with open(temp_file, "wb") as f:
-            data_to_save = json.dumps(self.config).encode("utf-8")
-            encrypted_data_to_save = self.encrypt_data(data_to_save, self.encryption_key)
-            f.write(b"DBv1" + salt + encrypted_data_to_save)
-
-        # Replace the original Duo file with the temporary file
-        shutil.move(temp_file, self.config_file)
-
-        # Restore the "encrypted_data" key to the config dictionary, if it was removed
-        if encrypted_data is not None:
-            self.config["encrypted_data"] = encrypted_data
+        self.vault_digest = None
+        self.lock_file = None
 
     @staticmethod
-    def prompt_activation_code_and_host_name():
-        code = input("Please provide the activation code (leave empty to cancel): ").strip()
-        host = input('Please provide the host name (e.g. "api-e0724a16.duosecurity.com", leave empty to cancel): ').strip()
-        if not code or not host:
-            return None, None
-        else:
-            return code, host
-
-    def prompt_qr_code(self):
-        print("Please provide the QR code image file path (leave empty to cancel): ")
-        file_path = input().strip()
-        if not file_path:
+    def ask(prompt):
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
             return None
-        if os.path.exists(file_path):
-            return file_path
-        else:
-            print("Invalid file path. Please try again.")
-        return self.prompt_qr_code()
+
+    @classmethod
+    def menu(cls, title, *options, back="Back"):
+        while True:
+            print(f"\n{title}")
+            for number, option in enumerate(options, 1):
+                print(f"{number}. {option}")
+            choice = cls.ask(f"0. {back}\nSelect: ")
+            if choice in (None, "", "0"):
+                return None
+            if choice in map(str, range(1, len(options) + 1)):
+                return int(choice)
+            print("Invalid selection.")
+
+    @staticmethod
+    def password(prompt, confirm=False):
+        while True:
+            try:
+                password = getpass.getpass(prompt)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if not password:
+                return None
+            if confirm and len(password) < 12:
+                print("Use at least 12 characters for the vault password.")
+                continue
+            if not confirm:
+                return password
+            try:
+                repeated = getpass.getpass("Confirm password: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if password == repeated:
+                return password
+            print("Passwords do not match.")
+
+    def select_vault(self):
+        vaults = sorted(
+            (path for path in Path.cwd().glob("*.duo") if path.is_file()),
+            key=lambda path: path.name.lower(),
+        )
+        if len(vaults) == 1:
+            self.config_file = vaults[0]
+            print(f"Vault: {vaults[0].name}")
+            return True
+        if vaults:
+            choice = self.menu("Vaults", *(path.name for path in vaults), back="Exit")
+            if choice is None:
+                return False
+            self.config_file = vaults[choice - 1]
+            return True
+
+        print("No Duo vault found. Create one to continue.")
+        while True:
+            name = self.ask("Vault name (leave empty to exit): ")
+            if not name:
+                return False
+            if Path(name).name != name:
+                print("Enter a filename, not a path.")
+                continue
+            self.config_file = Path(
+                name if name.lower().endswith(".duo") else name + ".duo"
+            )
+            return True
+
+    @staticmethod
+    def derive_v2_key(password, salt):
+        try:
+            return bytearray(
+                scrypt(
+                    password.encode("utf-8"),
+                    salt,
+                    64,
+                    N=SCRYPT_N,
+                    r=SCRYPT_R,
+                    p=SCRYPT_P,
+                )
+            )
+        except (MemoryError, ValueError, UnicodeError) as error:
+            raise RuntimeError("Vault key derivation failed") from error
+
+    @staticmethod
+    def wipe(value):
+        if isinstance(value, bytearray):
+            value[:] = b"\0" * len(value)
+
+    def decrypt_vault(self, blob, password):
+        if not isinstance(blob, bytes) or len(blob) < 4:
+            raise ValueError("Invalid vault")
+        magic = blob[:4]
+        key = plaintext = None
+        try:
+            if magic == DB_V2:
+                if len(blob) <= 4 + SALT_SIZE + NONCE_SIZE + TAG_SIZE:
+                    raise ValueError("Truncated vault")
+                salt = blob[4:20]
+                nonce = blob[20:36]
+                tag = blob[36:52]
+                ciphertext = blob[52:]
+                key = self.derive_v2_key(password, salt)
+                cipher = AES.new(key, AES.MODE_SIV, nonce=nonce)
+                cipher.update(blob[:36])
+                plaintext = bytearray(cipher.decrypt_and_verify(ciphertext, tag))
+                legacy = False
+            elif magic == DB_V1:
+                encrypted = blob[20:]
+                if (
+                    len(blob) < 52
+                    or len(encrypted[16:]) % AES.block_size
+                    or not encrypted[16:]
+                ):
+                    raise ValueError("Truncated legacy vault")
+                salt, iv, ciphertext = blob[4:20], encrypted[:16], encrypted[16:]
+                key = bytearray(
+                    PBKDF2(
+                        password.encode("utf-8"),
+                        salt,
+                        32,
+                        count=100000,
+                        hmac_hash_module=SHA256,
+                    )
+                )
+                plaintext = bytearray(
+                    unpad(
+                        AES.new(key, AES.MODE_CBC, iv).decrypt(ciphertext),
+                        AES.block_size,
+                    )
+                )
+                legacy = True
+            else:
+                raise ValueError("Unsupported vault version")
+
+            config = json.loads(plaintext.decode("utf-8"))
+            if not isinstance(config, dict) or (
+                "keys" in config and not isinstance(config["keys"], dict)
+            ):
+                raise ValueError("Invalid vault data")
+            config.setdefault("keys", {})
+            return config, key, salt, legacy
+        except BaseException:
+            self.wipe(key)
+            raise
+        finally:
+            self.wipe(plaintext)
+
+    def lock_vault(self):
+        if self.lock_file:
+            return True
+        if not self.config_file:
+            return False
+        descriptor = lock_file = None
+        try:
+            lock_path = Path(str(Path(self.config_file).absolute()) + ".lock")
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            lock_file = os.fdopen(descriptor, "r+b", buffering=0)
+            descriptor = None
+            lock_file.seek(0, os.SEEK_END)
+            if not lock_file.tell():
+                lock_file.write(b"\0")
+            lock_file.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if lock_file:
+                lock_file.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+            return False
+        self.lock_file = lock_file
+        return True
+
+    def load_config(self):
+        if not self.lock_vault():
+            print("This vault is already open or could not be locked.")
+            return False
+        loaded = False
+        try:
+            path = Path(self.config_file)
+            if not path.exists():
+                password = self.password(
+                    "Create a vault password (leave empty to cancel): ", confirm=True
+                )
+                if password is None:
+                    return False
+                salt = get_random_bytes(SALT_SIZE)
+                try:
+                    key = self.derive_v2_key(password, salt)
+                except RuntimeError:
+                    print("Not enough resources to secure the vault.")
+                    return False
+                password = None
+                self.config = {"keys": {}}
+                try:
+                    self.save_config(key=key, salt=salt)
+                except (OSError, ValueError):
+                    self.wipe(key)
+                    self.config.clear()
+                    print("Could not create the encrypted vault.")
+                    return False
+                self.salt, self.encryption_key = salt, key
+                loaded = True
+                return True
+
+            try:
+                blob = path.read_bytes()
+            except OSError:
+                print("Could not read the vault.")
+                return False
+            self.vault_digest = SHA256.new(blob).digest()
+
+            for attempt in range(3):
+                password = self.password("Vault password (leave empty to cancel): ")
+                if password is None:
+                    return False
+                try:
+                    config, key, salt, legacy = self.decrypt_vault(blob, password)
+                except RuntimeError:
+                    print("Not enough resources to unlock the vault.")
+                    return False
+                except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+                    print("Wrong password or damaged vault.")
+                    continue
+
+                self.config = config
+                if legacy:
+                    new_salt = get_random_bytes(SALT_SIZE)
+                    try:
+                        new_key = self.derive_v2_key(password, new_salt)
+                    except RuntimeError:
+                        self.wipe(key)
+                        self.config.clear()
+                        print("Not enough resources to migrate the legacy vault.")
+                        return False
+                    try:
+                        self.save_config(key=new_key, salt=new_salt)
+                    except (OSError, ValueError):
+                        self.wipe(key)
+                        self.wipe(new_key)
+                        self.config.clear()
+                        print("The legacy vault could not be securely migrated.")
+                        return False
+                    self.wipe(key)
+                    key, salt = new_key, new_salt
+                    print("Vault security upgraded to DBv2.")
+                password = None
+                self.salt, self.encryption_key = salt, key
+                loaded = True
+                return True
+
+            print("Too many failed password attempts.")
+            return False
+        finally:
+            if not loaded:
+                self.close()
+
+    def save_config(self, key=None, salt=None):
+        if not self.lock_vault():
+            raise OSError("Vault is already open in another process")
+        key = key if key is not None else self.encryption_key
+        salt = salt if salt is not None else self.salt
+        if key is None or salt is None or len(key) != 64 or len(salt) != SALT_SIZE:
+            raise ValueError("Vault is not unlocked")
+
+        plaintext = bytearray(
+            json.dumps(self.config, separators=(",", ":")).encode("utf-8")
+        )
+        temp_path = None
+        try:
+            nonce = get_random_bytes(NONCE_SIZE)
+            header = DB_V2 + salt + nonce
+            cipher = AES.new(key, AES.MODE_SIV, nonce=nonce)
+            cipher.update(header)
+            ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+            encrypted = header + tag + ciphertext
+
+            path = Path(self.config_file)
+            if self.vault_digest is None:
+                if path.exists():
+                    raise OSError("Vault appeared after it was opened")
+            else:
+                try:
+                    current_digest = SHA256.new(path.read_bytes()).digest()
+                except OSError as error:
+                    raise OSError("Vault changed or disappeared") from error
+                if current_digest != self.vault_digest:
+                    raise OSError("Vault was changed by another process")
+            descriptor, temp_path = tempfile.mkstemp(
+                dir=str(path.parent or Path.cwd()),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            with os.fdopen(descriptor, "wb") as temporary:
+                temporary.write(encrypted)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+            self.vault_digest = SHA256.new(encrypted).digest()
+            if os.name == "posix":
+                try:
+                    directory = os.open(path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                except OSError:
+                    pass
+        finally:
+            self.wipe(plaintext)
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    def change_password(self):
+        password = self.password(
+            "New vault password (leave empty to cancel): ", confirm=True
+        )
+        if password is None:
+            return
+        salt = get_random_bytes(SALT_SIZE)
+        try:
+            key = self.derive_v2_key(password, salt)
+        except RuntimeError:
+            print("Not enough resources to change the vault password.")
+            return
+        password = None
+        try:
+            self.save_config(key=key, salt=salt)
+        except (OSError, ValueError):
+            self.wipe(key)
+            print("Could not change the vault password.")
+            return
+        self.wipe(self.encryption_key)
+        self.salt, self.encryption_key = salt, key
+        print("Vault password changed.")
+
+    @staticmethod
+    def parse_activation_url(activation_url):
+        if not activation_url or any(
+            character.isspace() for character in activation_url
+        ):
+            raise ValueError("expected one HTTPS activation URL")
+        try:
+            parsed = urllib.parse.urlsplit(activation_url)
+            host = parsed.hostname.lower() if parsed.hostname else ""
+            port = parsed.port
+        except (AttributeError, ValueError) as error:
+            raise ValueError("malformed activation URL") from error
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("invalid activation URL")
+        host_match = re.fullmatch(r"m-([0-9a-f]{8})\.duosecurity\.com", host)
+        path_match = re.fullmatch(r"/activate/([A-Za-z0-9_-]{20})", parsed.path)
+        if not host_match or not path_match:
+            raise ValueError("invalid Duo activation URL")
+        return path_match.group(1), f"api-{host_match.group(1)}.duosecurity.com"
 
     def parse_qr_code(self, file_path):
-        img = Image.open(file_path)
-
-        decoded_data = pyzbar_decode(img)
-        if decoded_data:
-            qr_data = decoded_data[0].data.decode()
-            code, host = map(lambda x: x.strip("<>"), qr_data.split("-"))
-            missing_padding = len(host) % 4
-            if missing_padding:
-                host += "=" * (4 - missing_padding)
-            return code, base64.b64decode(host.encode("ascii")).decode("ascii")
-        else:
-            print("Error: Could not decode the QR code. Please try again.")
+        try:
+            with Image.open(file_path) as image:
+                decoded = pyzbar_decode(image)
+            if len(decoded) != 1:
+                raise ValueError("the image must contain exactly one QR code")
+            url = decoded[0].data.decode("utf-8").strip()
+            self.parse_activation_url(url)
+            return url
+        except (
+            OSError,
+            ValueError,
+            UnicodeDecodeError,
+            Image.DecompressionBombError,
+        ) as error:
+            print(f"Could not read the QR code: {error}")
             return None
 
     def activate(self, code, host):
-        url = f"https://{host}/push/v2/activation/{code}"
-
+        key_pair = RSA.generate(2048)
+        public_key = key_pair.publickey().export_key("PEM").decode("ascii")
+        private_key = key_pair.export_key("PEM").decode("ascii")
         headers = {
-            "User-Agent": "DuoMobileApp/4.73.0.873.1 (arm64; iOS 18.1); Client: Foundation",
+            "User-Agent": "DuoMobileApp/4.117.1 (arm64; iOS 26.6); Client: Foundation",
             "Accept": "*/*",
             "Accept-Language": "en-us",
-            "Accept-Encoding": "gzip, deflate, br"
-            # "Content-Type": "application/x-www-form-urlencoded",
         }
-
-        key_pair = RSA.generate(2048)
-        pubkey_data = key_pair.publickey().export_key("PEM").decode("ascii")
-        privkey_data = key_pair.export_key("PEM").decode("ascii")
-
         data = {
             "app_id": "com.duosecurity.DuoMobile",
-            "app_version": "4.73.0.873.1",
-            "ble_status": "allowed",  # NOTE: can also be "undetermined"
-            "build_version": "24B5055e",
+            "app_version": "4.117.1",
+            "ble_status": "allowed",
+            "build_version": "23G71",
             "customer_protocol": "1",
-            "device_name": "iPad",
+            "device_name": "iPhone",
             "jailbroken": "false",
             "language": "en",
             "manufacturer": "Apple",
@@ -257,268 +468,509 @@ class DuoAuthenticator:
             "passcode_status": "true",
             "pkpush": "rsa-sha512",
             "platform": "iOS",
-            "pubkey": pubkey_data,
+            "pubkey": public_key,
             "region": "US",
             "security_patch_level": "",
             "touchid_status": "true",
-            "version": "18.1"
+            "version": "26.6",
         }
+        try:
+            response = requests.post(
+                f"https://{host}/push/v2/activation/{code}",
+                headers=headers,
+                data=data,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            activation = payload.get("response") if isinstance(payload, dict) else None
+            if not isinstance(activation, dict):
+                raise ValueError("Activation was rejected")
+            return activation, public_key, private_key
+        except (requests.RequestException, ValueError, TypeError):
+            print("Duo activation failed. Check the code, host, and connection.")
+            return None
 
-        r = requests.post(url, headers=headers, data=data, verify=VERIFY_SSL)
-        response = r.json()
+    def add_key(self):
+        method = self.menu("Add key", "QR code image", "Activation code and host")
+        if method is None:
+            return
 
-        if "response" in response:
-            return response["response"], pubkey_data, privkey_data
-        else:
-            print("Error during activation. Please try again.")
-            print(f"Server response: {response}")
-            sys.exit(1)
+        while True:
+            name = self.ask("Nickname (leave empty to cancel): ")
+            if not name:
+                return
+            if name not in self.config["keys"]:
+                break
+            print("That nickname already exists.")
 
-    def generate_signature(self, method, path, time, data, key_config):
-        message = (time + "\n" + method + "\n" + key_config["host"].lower() + "\n" +
-                   path + "\n" + urllib.parse.urlencode(data)).encode("ascii")
-
-        h = SHA512.new(message)
-        signature = pkcs1_15.new(self.pubkey).sign(h)
-        auth = ("Basic " + base64.b64encode((key_config["response"]["pkey"] + ":" +
-                                             base64.b64encode(signature).decode("ascii")).encode("ascii")).decode("ascii"))
-        return auth
-
-    def get_transactions(self, key_config):
-        dt = datetime.datetime.now(datetime.timezone.utc)
-        time = email.utils.format_datetime(dt)
-        path = "/push/v2/device/transactions"
-
-        data = {
-            "akey": key_config["response"]["akey"],
-            "fips_status": "1",
-            "hsm_status": "true",
-            "pkpush": "rsa-sha512"
-        }
-
-        signature = self.generate_signature("GET", path, time, data, key_config)
-
-        headers = {
-            "Authorization": signature,
-            "x-duo-date": time,
-            "host": key_config["host"]
-        }
-
-        r = requests.get(f"https://{key_config['host']}{path}", params=data, headers=headers, verify=VERIFY_SSL)
-
-        return r.json()
-
-    def reply_transaction(self, transaction_id, answer, key_config):
-        dt = datetime.datetime.now(datetime.timezone.utc)
-        time = email.utils.format_datetime(dt)
-        path = "/push/v2/device/transactions/" + transaction_id
-
-        data = {
-            "akey": key_config["response"]["akey"],
-            "answer": answer,
-            "fips_status": "1",
-            "hsm_status": "true",
-            "pkpush": "rsa-sha512"
-        }
-
-        signature = self.generate_signature("POST", path, time, data, key_config)
-
-        headers = {
-            "Authorization": signature,
-            "x-duo-date": time,
-            "host": key_config["host"],
-            "txId": transaction_id
-        }
-
-        r = requests.post(f"https://{key_config['host']}{path}", data=data, headers=headers, verify=VERIFY_SSL)
-
-        return r.json()
-
-    def approve_push_notifications(self, key_name):
-        key_config = self.config["keys"][key_name]
-        self.import_key(key_config["privkey"])
-
-        if "response" in key_config:
-            failed_attempts = 0
-            while True:
-                if failed_attempts >= 10:
-                    print("Reached 10 failed attempts. Returning to previous menu...")
-                    break
-
-                try:
-                    r = self.get_transactions(key_config)
-                except requests.exceptions.ConnectionError:
-                    print("Connection Error")
-                    time.sleep(5)
+        while True:
+            if method == 1:
+                file_path = self.ask("QR image path (leave empty to cancel): ")
+                if not file_path:
+                    return
+                url = self.parse_qr_code(file_path.strip('"'))
+                if not url:
                     continue
-
-                approved = False
-
-                if "response" in r and "transactions" in r["response"]:
-                    transactions = r["response"]["transactions"]
-                    print("Checking for transactions")
-                    if transactions:
-                        for tx in transactions:
-                            print(tx)
-                            reply = self.reply_transaction(tx["urgid"], "approve", key_config)
-                            approved = True
-                            break
-                        if approved:
-                            print("Transaction approved. Returning to previous menu...")
-                            break
-                    else:
-                        print("No transactions")
-                        failed_attempts += 1
-                else:
-                    print(f"Error fetching transactions. Server response: {r}. Retrying...")
-                    failed_attempts += 1
-
-                time.sleep(10)
-        else:
-            print("Error: Activation response is missing. Please try again.")
-            sys.exit(1)
-
-    def show_recent_hotp_codes(self, key_name, count=10):
-        if "hotp_log" in self.config["keys"][key_name]:
-            recent_codes = self.config["keys"][key_name]["hotp_log"][-count:]
-            print(f"Last {count} HOTP codes for {key_name}:")
-            for code in recent_codes:
-                print(code)
-        else:
-            print(f"No recent HOTP codes found for {key_name}.")
-
-    def authenticate(self, key_name):
-        if key_name in self.config["keys"]:
-            print("Select authentication method:")
-            print("1. Duo Push")
-            print("2. HOTP")
-            print("3. Show recent HOTP codes")
-            auth_method = input("Enter the number (1, 2, or 3) corresponding to the method you want to use: ")
-
-            if auth_method == "1":
-                self.approve_push_notifications(key_name)
-            elif auth_method == "2":
-                response = self.config["keys"][key_name]["response"]
-                hotp_secret = base64.b32encode(response["hotp_secret"].encode("ascii")).decode("ascii")
-                hotp = pyotp.HOTP(hotp_secret)
-
-                if "hotp_counter" in self.config["keys"][key_name]:
-                    self.config["keys"][key_name]["hotp_counter"] += 1
-                else:
-                    self.config["keys"][key_name]["hotp_counter"] = 1
-
-                if "hotp_log" not in self.config["keys"][key_name]:
-                    self.config["keys"][key_name]["hotp_log"] = []
-
-                hotp_code = hotp.at(self.config["keys"][key_name]["hotp_counter"])
-                print(f"Generated HOTP code: {hotp_code}")
-
-                self.config["keys"][key_name]["hotp_log"].append(f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} ({key_name}): {hotp_code}")
-                self.save_config()
-            elif auth_method == "3":
-                self.show_recent_hotp_codes(key_name)
+                code, host = self.parse_activation_url(url)
             else:
-                print("Invalid input. Please try again.")
-                self.authenticate(key_name)
-        else:
-            print("Error: Key not found. Please try again.")
-            sys.exit(1)
+                code = self.ask("Activation code (leave empty to cancel): ")
+                if not code:
+                    return
+                host = self.ask("API host (leave empty to cancel): ")
+                if not host:
+                    return
+                host = host.lower().removeprefix("https://").rstrip("/")
+                if not re.fullmatch(r"[A-Za-z0-9_-]{20}", code) or not re.fullmatch(
+                    r"api-[0-9a-f]{8}\.duosecurity\.com", host
+                ):
+                    print("Invalid Duo activation code or API host. Try again.")
+                    continue
+            break
+
+        activated = self.activate(code, host)
+        while not activated:
+            retry = self.ask("Retry this activation? [Y/n]: ")
+            if retry is None or retry.lower() == "n":
+                return
+            activated = self.activate(code, host)
+
+        response, public_key, private_key = activated
+        self.config["keys"][name] = {
+            "code": code,
+            "host": host,
+            "response": response,
+            "pubkey": public_key,
+            "privkey": private_key,
+        }
+        while True:
+            try:
+                self.save_config()
+                print(f"Key '{name}' added.")
+                return
+            except (OSError, ValueError):
+                print(
+                    "Save failed. This activation may be one-use; leaving now "
+                    "permanently discards it."
+                )
+                retry = self.ask("Retry saving? [Y/n]: ")
+                if retry is None or retry.lower() == "n":
+                    self.config["keys"].pop(name, None)
+                    print("The activated key was not saved.")
+                    return
+
+    def duo_request(self, key_config, method, path, data):
+        private_key = RSA.import_key(key_config["privkey"].encode("ascii"))
+        duo_date = email.utils.format_datetime(
+            datetime.datetime.now(datetime.timezone.utc)
+        )
+        message = "\n".join(
+            (
+                duo_date,
+                method,
+                key_config["host"].lower(),
+                path,
+                urllib.parse.urlencode(data),
+            )
+        ).encode("ascii")
+        signature = pkcs1_15.new(private_key).sign(SHA512.new(message))
+        authorization = "Basic " + base64.b64encode(
+            (
+                key_config["response"]["pkey"]
+                + ":"
+                + base64.b64encode(signature).decode("ascii")
+            ).encode("ascii")
+        ).decode("ascii")
+        headers = {
+            "Authorization": authorization,
+            "x-duo-date": duo_date,
+            "host": key_config["host"],
+        }
+        if method == "POST":
+            headers["txId"] = path.rsplit("/", 1)[-1]
+        response = requests.request(
+            method,
+            f"https://{key_config['host']}{path}",
+            headers=headers,
+            params=data if method == "GET" else None,
+            data=data if method == "POST" else None,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("Invalid Duo response")
+        return result
+
+    @classmethod
+    def prompt_step_up_code(cls, step_up_code_info):
+        digits = (
+            step_up_code_info.get("num_digits")
+            if isinstance(step_up_code_info, dict)
+            else None
+        )
+        if (
+            isinstance(digits, bool)
+            or not isinstance(digits, int)
+            or not 3 <= digits <= 7
+        ):
+            raise ValueError("invalid Verified Duo Push metadata")
+        while True:
+            code = cls.ask(
+                f"Enter the {digits}-digit verification code (blank to stop): "
+            )
+            if not code:
+                return None
+            if len(code) == digits and code.isascii() and code.isdecimal():
+                return code
+            print(f"Enter exactly {digits} ASCII digits.")
+
+    def push_loop(self, key_name):
+        key = self.config["keys"][key_name]
+        response = key.get("response") if isinstance(key, dict) else None
+        valid_host = (
+            isinstance(key, dict)
+            and isinstance(key.get("host"), str)
+            and re.fullmatch(r"api-[0-9a-f]{8}\.duosecurity\.com", key["host"].lower())
+        )
+        if (
+            not valid_host
+            or not isinstance(key.get("privkey"), str)
+            or not isinstance(response, dict)
+            or not isinstance(response.get("akey"), str)
+            or not isinstance(response.get("pkey"), str)
+            or not re.fullmatch(r"[A-Za-z0-9._~-]{1,512}", response["akey"])
+            or not re.fullmatch(r"[A-Za-z0-9._~-]{1,512}", response["pkey"])
+        ):
+            print("This key has invalid Duo Mobile Push data.")
+            return
+        try:
+            RSA.import_key(key["privkey"].encode("ascii"))
+        except (ValueError, TypeError, IndexError, UnicodeError):
+            print("This key has an invalid Duo Mobile Push signing key.")
+            return
+        handled = set()
+        print("\nChecking continuously. Press Ctrl+C to return to the key menu.")
+        try:
+            while True:
+                try:
+                    common = {
+                        "akey": key["response"]["akey"],
+                        "fips_status": "1",
+                        "hsm_status": "true",
+                        "pkpush": "rsa-sha512",
+                    }
+                    result = self.duo_request(
+                        key, "GET", "/push/v2/device/transactions", common
+                    )
+                    response = result.get("response")
+                    transactions = (
+                        response.get("transactions")
+                        if isinstance(response, dict)
+                        else None
+                    )
+                    if not isinstance(transactions, list):
+                        raise ValueError("Invalid transaction list")
+                    handled.intersection_update(
+                        transaction.get("urgid")
+                        for transaction in transactions
+                        if isinstance(transaction, dict)
+                    )
+
+                    for transaction in transactions:
+                        if (
+                            not isinstance(transaction, dict)
+                            or not isinstance(transaction.get("urgid"), str)
+                            or not re.fullmatch(
+                                r"[A-Za-z0-9_-]{1,128}", transaction["urgid"]
+                            )
+                        ):
+                            print("Skipped a malformed Duo transaction.")
+                            continue
+                        if transaction["urgid"] in handled:
+                            continue
+                        expiration = transaction.get("expiration")
+                        if (
+                            isinstance(expiration, (int, float))
+                            and not isinstance(expiration, bool)
+                            and time.time() >= expiration
+                        ):
+                            print("Skipped an expired Duo transaction.")
+                            handled.add(transaction["urgid"])
+                            continue
+
+                        info = transaction.get("step_up_code_info")
+                        push_name = (
+                            "Verified Duo Push"
+                            if info is not None
+                            else "Duo Mobile Push"
+                        )
+                        summary = (
+                            transaction.get("summary")
+                            or transaction.get("type")
+                            or "Sign-in"
+                        )
+                        print(f"\n{push_name}: {summary}")
+                        while True:
+                            if (
+                                isinstance(expiration, (int, float))
+                                and not isinstance(expiration, bool)
+                                and time.time() >= expiration
+                            ):
+                                print(f"{push_name} expired.")
+                                break
+                            code = None
+                            if info is not None:
+                                try:
+                                    code = self.prompt_step_up_code(info)
+                                except ValueError as error:
+                                    print(f"Cannot process {push_name}: {error}.")
+                                    handled.add(transaction["urgid"])
+                                    break
+                                if code is None:
+                                    return
+                            else:
+                                while True:
+                                    action = self.ask(
+                                        "[y] Approve, [s] skip, [q] back: "
+                                    )
+                                    action = action.lower() if action else action
+                                    if action in (None, "q"):
+                                        return
+                                    if action == "y":
+                                        break
+                                    if action in ("", "s", "n"):
+                                        handled.add(transaction["urgid"])
+                                        print("Duo Mobile Push skipped.")
+                                        break
+                                    print("Enter y, s, or q.")
+                                if transaction["urgid"] in handled:
+                                    break
+                            reply_data = {
+                                "akey": common["akey"],
+                                "answer": "approve",
+                                "fips_status": "1",
+                                "hsm_status": "true",
+                                "pkpush": "rsa-sha512",
+                            }
+                            if code is not None:
+                                reply_data.update(
+                                    step_up_code=code,
+                                    step_up_code_autofilled="false",
+                                )
+                            reply = self.duo_request(
+                                key,
+                                "POST",
+                                "/push/v2/device/transactions/" + transaction["urgid"],
+                                reply_data,
+                            )
+                            if reply.get("stat") == "OK":
+                                print(f"{push_name} approved.")
+                                handled.add(transaction["urgid"])
+                                break
+                            if info is not None and str(reply.get("code")) == "40032":
+                                print("Incorrect verification code.")
+                                continue
+                            message = reply.get("message")
+                            print(
+                                f"{push_name} rejected"
+                                + (f": {message}" if message else ".")
+                            )
+                            handled.add(transaction["urgid"])
+                            break
+                except (
+                    requests.RequestException,
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                    UnicodeError,
+                ):
+                    print("Duo Mobile Push / Verified Duo Push check failed; retrying.")
+                time.sleep(POLL_SECONDS)
+        except (KeyboardInterrupt, EOFError):
+            print("\nStopped checking for Duo Mobile Push / Verified Duo Push.")
+
+    def generate_passcode(self, key_name):
+        key = self.config["keys"][key_name]
+        if not isinstance(key, dict):
+            print("This key has invalid Duo Mobile Passcode data.")
+            return
+        response = key.get("response")
+        counter = key.get("hotp_counter", 0)
+        history = key.get("hotp_log", [])
+        if (
+            not isinstance(response, dict)
+            or not isinstance(counter, int)
+            or isinstance(counter, bool)
+            or not 0 <= counter < 2**64 - 1
+            or not isinstance(history, list)
+        ):
+            print("This key has invalid Duo Mobile Passcode data.")
+            return
+        try:
+            raw_secret = response["hotp_secret"]
+            if not isinstance(raw_secret, str):
+                raise TypeError
+            secret = base64.b32encode(raw_secret.encode("ascii")).decode("ascii")
+            next_counter = counter + 1
+            code = pyotp.HOTP(secret).at(next_counter)
+        except (KeyError, TypeError, UnicodeError, ValueError):
+            print("This key does not support Duo Mobile Passcodes.")
+            return
+
+        had_counter, had_history = "hotp_counter" in key, "hotp_log" in key
+        old_counter, old_history = key.get("hotp_counter"), key.get("hotp_log")
+        key["hotp_counter"] = next_counter
+        if not had_history:
+            key["hotp_log"] = history
+        history.append(
+            f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M:%S} "
+            f"({key_name}): {code}"
+        )
+        try:
+            self.save_config()
+        except (OSError, ValueError):
+            if had_counter:
+                key["hotp_counter"] = old_counter
+            else:
+                key.pop("hotp_counter", None)
+            if had_history:
+                history.pop()
+            else:
+                key.pop("hotp_log", None)
+            print("Passcode was not generated because the vault could not be saved.")
+            return
+        print(f"Duo Mobile Passcode: {code}")
+
+    def passcode_history(self, key_name):
+        key = self.config["keys"][key_name]
+        if not isinstance(key, dict):
+            print("This key has invalid passcode history.")
+            return
+        history = key.get("hotp_log", [])
+        if not isinstance(history, list):
+            print("This key has invalid passcode history.")
+            return
+        if not history:
+            print("No Duo Mobile Passcode history.")
+            return
+        while True:
+            print(f"\nNewest 10 of {len(history)} saved Duo Mobile Passcodes:")
+            for entry in history[-10:]:
+                print(entry)
+            choice = self.menu(
+                "History actions", "Delete older history (keep newest 10)"
+            )
+            if choice is None:
+                return
+            if choice == 1:
+                if len(history) <= 10:
+                    print("There is no older history to delete.")
+                    continue
+                confirm = self.ask(f"Delete {len(history) - 10} older entries? [y/N]: ")
+                if confirm and confirm.lower() == "y":
+                    old_history = history
+                    history = history[-10:]
+                    key["hotp_log"] = history
+                    try:
+                        self.save_config()
+                        print("Older passcode history deleted.")
+                    except (OSError, ValueError):
+                        history = old_history
+                        key["hotp_log"] = old_history
+                        print("Could not save the history change.")
+
+    def keys_menu(self):
+        while True:
+            names = list(self.config["keys"])
+            if not names:
+                print("No keys saved.")
+                return
+            labels = []
+            for name in names:
+                key = self.config["keys"][name]
+                response = key.get("response") if isinstance(key, dict) else None
+                organization = (
+                    response.get("customer_name")
+                    if isinstance(response, dict)
+                    else None
+                )
+                labels.append(name + (f" ({organization})" if organization else ""))
+            choice = self.menu("Keys", *labels)
+            if choice is None:
+                return
+            name = names[choice - 1]
+
+            while name in self.config["keys"]:
+                action = self.menu(
+                    name,
+                    "Duo Mobile Push / Verified Duo Push",
+                    "Generate Duo Mobile Passcode",
+                    "Duo Mobile Passcode history",
+                    "Delete key",
+                )
+                if action is None:
+                    break
+                if action == 1:
+                    self.push_loop(name)
+                elif action == 2:
+                    self.generate_passcode(name)
+                elif action == 3:
+                    self.passcode_history(name)
+                elif action == 4:
+                    if self.ask(f"Delete '{name}'? [y/N]: ") not in ("y", "Y"):
+                        continue
+                    deleted = self.config["keys"].pop(name)
+                    try:
+                        self.save_config()
+                        print(f"Key '{name}' deleted.")
+                    except (OSError, ValueError):
+                        self.config["keys"][name] = deleted
+                        print("Could not save the deletion.")
+                    break
 
     def main_menu(self):
         while True:
-            print("\nMain Menu:")
-            print("1. Add a new key using a QR Code")
-            print("2. Add a new key using an activation code and host")
-            print("3. Delete a key")
-            print("4. List keys")
-            print("5. Authenticate")
-            print("6. Change password")
-            print("7. Exit")
-
-            choice = input("Enter the number (1, 2, 3, 4, 5, 6 or 7) corresponding to the action you want to perform: ")
-
-            if choice == "1":
-                self.add_key("qr_code")
-            if choice == "2":
-                self.add_key("activation_code_and_host_name")
-            elif choice == "3":
-                self.delete_key()
-            elif choice == "4":
-                self.list_keys()
-            elif choice == "5":
-                self.authenticate_key()
-            elif choice == "6":
+            choice = self.menu(
+                "Main menu", "Add key", "Keys", "Change vault password", back="Exit"
+            )
+            if choice is None:
+                return
+            if choice == 1:
+                self.add_key()
+            elif choice == 2:
+                self.keys_menu()
+            elif choice == 3:
                 self.change_password()
-            elif choice == "7":
-                print("Exiting...")
-                self.save_config()
-                sys.exit(0)
-            else:
-                print("Invalid input. Please try again.")
 
-    def add_key(self, mode):
-        while True:
-            key_name = input("Enter a nickname for the new key (leave empty to cancel): ").strip()
-            if not key_name:
-                print("Returning to the main menu.")
-                break
-            if key_name not in self.config["keys"]:
-                if mode == "activation_code_and_host_name":
-                    code, host = self.prompt_activation_code_and_host_name()
-                    if code is not None and host is not None:
-                        response, pubkey, privkey = self.activate(code, host)
-                        self.config["keys"][key_name] = {"code": code, "host": host, "response": response, "pubkey": pubkey, "privkey": privkey}
-                        self.save_config()
-                        print(f"Key '{key_name}' added successfully.")
-                    else:
-                        print("No activation code or host name provided. Returning to the main menu.")
-                    break
-                elif mode == "qr_code":
-                    qr_file_path = self.prompt_qr_code()
-                    if qr_file_path is not None:
-                        parsed_data = self.parse_qr_code(qr_file_path)
-                        if parsed_data is not None:
-                            code, host = parsed_data
-                            response, pubkey, privkey = self.activate(code, host)
-                            self.config["keys"][key_name] = {"code": code, "host": host, "response": response, "pubkey": pubkey, "privkey": privkey}
-                            self.save_config()
-                            print(f"Key '{key_name}' added successfully.")
-                        else:
-                            print("Could not add the key. Returning to the main menu.")
-                    else:
-                        print("No QR code file provided. Returning to the main menu.")
-                    break
+    def close(self):
+        lock_file, self.lock_file = self.lock_file, None
+        if lock_file:
+            try:
+                lock_file.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
-                    raise ValueError(f"Invalid mode {mode}")
-            else:
-                print("Error: Key with the same name already exists. Please try again.")
-
-    def delete_key(self):
-        key_name = input("Enter the nickname of the key you want to delete: ")
-        if key_name in self.config["keys"]:
-            del self.config["keys"][key_name]
-            self.save_config()
-            print(f"Key '{key_name}' deleted successfully.")
-        else:
-            print("Error: Key not found. Please try again.")
-
-    def list_keys(self):
-        print("Keys:")
-        for key_name in self.config["keys"]:
-            print(f"- {key_name} ({self.config['keys'][key_name]['response']['customer_name']})")
-
-    def authenticate_key(self):
-        key_name = input("Enter the nickname of the key you want to use for authentication: ")
-        if key_name in self.config["keys"]:
-            self.authenticate(key_name)
-        else:
-            print("Error: Key not found. Please try again.")
-
-    def delete_encryption_key_from_memory(self):
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except (OSError, ValueError):
+                pass
+            try:
+                lock_file.close()
+            except OSError:
+                pass
+        self.wipe(self.encryption_key)
         self.encryption_key = None
+        self.salt = None
+        self.vault_digest = None
+        self.config.clear()
 
 
 if __name__ == "__main__":
-    authenticator = DuoAuthenticator()
-    atexit.register(authenticator.delete_encryption_key_from_memory)
-    authenticator.main_menu()
+    app = DuoAuthenticator()
+    try:
+        if (app.config_file or app.select_vault()) and app.load_config():
+            app.main_menu()
+    except (KeyboardInterrupt, EOFError):
+        print("\nExited safely.")
+    finally:
+        app.close()
