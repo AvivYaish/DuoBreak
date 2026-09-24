@@ -19,8 +19,9 @@ DuoBreak stores Duo Mobile credentials in a password-protected `.duo` vault and 
     pip install -r requirements.txt
     ```
 
-2. (for macOS only!) Install dependencies:
-
+2. Install dependencies.  
+   For Windows, if encountering an error mentioning libzbar-64.dll, download and install vcredist_x64.exe from [Microsoft](https://www.microsoft.com/en-gb/download/details.aspx?id=40784).  
+   For macOS:
     ```
     brew install zbar
     sudo ln -s $(brew --prefix zbar)/lib/libzbar.dylib /usr/local/lib/libzbar.dylib
@@ -34,7 +35,7 @@ DuoBreak stores Duo Mobile credentials in a password-protected `.duo` vault and 
 
 4. Follow the on-screen instructions to create a new password-protected vault for storing your authentication keys.
 
-5. On your computer, go to the Duo webpage and add a new device.
+5. On your computer, go to the Duo webpage and add a new Apple iOS tablet.
 
 6. Save the QR code image given by the webpage as a PNG file.
 

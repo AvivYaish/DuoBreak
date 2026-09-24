@@ -3,6 +3,11 @@
 # Version: 2.0.0
 # For security updates, visit github.com/JesseNaser/DuoBreak
 
+# When setting up a new Duo device, select Apple iOS tablet
+
+# If there's an error mentioning libzbar-64.dll, download and install vcredist_x64.exe from:
+# https://www.microsoft.com/en-gb/download/details.aspx?id=40784
+
 import base64
 import datetime
 import email.utils
@@ -65,9 +70,9 @@ class DuoAuthenticator:
             for number, option in enumerate(options, 1):
                 print(f"{number}. {option}")
             choice = cls.ask(f"0. {back}\nSelect: ")
-            if choice in (None, "", "0"):
-                return None
-            if choice in map(str, range(1, len(options) + 1)):
+            if choice in (None, ""):
+                return 1
+            if choice in map(str, range(0, len(options) + 1)):
                 return int(choice)
             print("Invalid selection.")
 
@@ -492,7 +497,7 @@ class DuoAuthenticator:
             return None
 
     def add_key(self):
-        method = self.menu("Add key", "QR code image", "Activation code and host")
+        method = self.menu("Add key", "Activation URL (m-HOST.duosecurity.com/activate/PATH)", "Activation code and host", "QR code image")
         if method is None:
             return
 
@@ -506,14 +511,15 @@ class DuoAuthenticator:
 
         while True:
             if method == 1:
-                file_path = self.ask("QR image path (leave empty to cancel): ")
-                if not file_path:
-                    return
-                url = self.parse_qr_code(file_path.strip('"'))
+                url = self.ask("Activation URL (leave empty to cancel): ")
                 if not url:
+                    return
+                match = re.fullmatch(r"https://m-([0-9a-fA-F]+)\.duosecurity\.com/activate/([A-Za-z0-9_-]+)", url)
+                if match is None:
+                    print("Invalid Duo activation URL")
                     continue
-                code, host = self.parse_activation_url(url)
-            else:
+                host, code = f"api-{match.group(1)}.duosecurity.com", match.group(2)
+            elif method == 2:
                 code = self.ask("Activation code (leave empty to cancel): ")
                 if not code:
                     return
@@ -526,6 +532,14 @@ class DuoAuthenticator:
                 ):
                     print("Invalid Duo activation code or API host. Try again.")
                     continue
+            elif method == 3:
+                file_path = self.ask("QR image path (leave empty to cancel): ")
+                if not file_path:
+                    return
+                url = self.parse_qr_code(file_path.strip('"'))
+                if not url:
+                    continue
+                code, host = self.parse_activation_url(url)
             break
 
         activated = self.activate(code, host)
@@ -861,7 +875,7 @@ class DuoAuthenticator:
             choice = self.menu(
                 "History actions", "Delete older history (keep newest 10)"
             )
-            if choice is None:
+            if choice == 0:
                 return
             if choice == 1:
                 if len(history) <= 10:
@@ -897,7 +911,7 @@ class DuoAuthenticator:
                 )
                 labels.append(name + (f" ({organization})" if organization else ""))
             choice = self.menu("Keys", *labels)
-            if choice is None:
+            if choice == 0:
                 return
             name = names[choice - 1]
 
@@ -909,7 +923,7 @@ class DuoAuthenticator:
                     "Duo Mobile Passcode history",
                     "Delete key",
                 )
-                if action is None:
+                if action == 0:
                     break
                 if action == 1:
                     self.push_loop(name)
@@ -932,14 +946,14 @@ class DuoAuthenticator:
     def main_menu(self):
         while True:
             choice = self.menu(
-                "Main menu", "Add key", "Keys", "Change vault password", back="Exit"
+                "Main menu", "Keys", "Add key", "Change vault password", back="Exit"
             )
-            if choice is None:
+            if choice is None or choice == 0:
                 return
-            if choice == 1:
-                self.add_key()
-            elif choice == 2:
+            elif choice == 1:
                 self.keys_menu()
+            elif choice == 2:
+                self.add_key()
             elif choice == 3:
                 self.change_password()
 
