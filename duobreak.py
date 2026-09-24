@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Version: 2.0.0
-# For security updates, visit github.com/JesseNaser/DuoBreak
-
+# Forked from github.com/JesseNaser/DuoBreak
 # When setting up a new Duo device, select Apple iOS tablet
-
-# If there's an error mentioning libzbar-64.dll, download and install vcredist_x64.exe from:
-# https://www.microsoft.com/en-gb/download/details.aspx?id=40784
 
 import base64
 import datetime
 import email.utils
 import getpass
+import hmac
 import json
 import os
-from pathlib import Path
 import re
 import tempfile
 import time
 import urllib.parse
+from pathlib import Path
 
 if os.name == "nt":
     import msvcrt
 else:
     import fcntl
 
+import pyotp
+import requests
 from Crypto.Cipher import AES
 from Crypto.Hash import SHA256, SHA512
 from Crypto.Protocol.KDF import PBKDF2, scrypt
@@ -33,10 +31,8 @@ from Crypto.Random import get_random_bytes
 from Crypto.Signature import pkcs1_15
 from Crypto.Util.Padding import unpad
 from PIL import Image
-import pyotp
-from pyzbar.pyzbar import decode as pyzbar_decode
-import requests
 
+from password_store import PasswordStore, PasswordStoreError
 
 DB_V1 = b"DBv1"
 DB_V2 = b"DBv2"
@@ -47,13 +43,14 @@ POLL_SECONDS = 5
 
 
 class DuoAuthenticator:
-    def __init__(self, config_file=None):
+    def __init__(self, config_file=None, password_store=None):
         self.config_file = Path(config_file) if config_file else None
         self.config = {}
         self.salt = None
         self.encryption_key = None
         self.vault_digest = None
         self.lock_file = None
+        self.password_store = password_store
 
     @staticmethod
     def ask(prompt):
@@ -64,15 +61,21 @@ class DuoAuthenticator:
             return None
 
     @classmethod
-    def menu(cls, title, *options, back="Back"):
+    def menu(cls, title, *options, back="Back", default=None):
+        """Return 1..N for an option, or None for Back/cancellation."""
+        if default is not None and not 1 <= default <= len(options):
+            raise ValueError("The default must identify a menu option")
         while True:
             print(f"\n{title}")
             for number, option in enumerate(options, 1):
                 print(f"{number}. {option}")
-            choice = cls.ask(f"0. {back}\nSelect: ")
-            if choice in (None, ""):
-                return 1
-            if choice in map(str, range(0, len(options) + 1)):
+            prompt = f"Select [{default}]: " if default is not None else "Select: "
+            choice = cls.ask(f"0. {back}\n{prompt}")
+            if choice in (None, "0"):
+                return None
+            if not choice:
+                return default
+            if choice in {str(number) for number in range(1, len(options) + 1)}:
                 return int(choice)
             print("Invalid selection.")
 
@@ -111,7 +114,7 @@ class DuoAuthenticator:
             return True
         if vaults:
             choice = self.menu("Vaults", *(path.name for path in vaults), back="Exit")
-            if choice is None:
+            if not choice:
                 return False
             self.config_file = vaults[choice - 1]
             return True
@@ -276,8 +279,20 @@ class DuoAuthenticator:
                 return False
             self.vault_digest = SHA256.new(blob).digest()
 
-            for attempt in range(3):
-                password = self.password("Vault password (leave empty to cancel): ")
+            try:
+                saved_password = self.get_password_store().load()
+            except PasswordStoreError:
+                saved_password = None
+                print("Saved password unavailable. Enter the vault password manually.")
+            had_saved_password = saved_password is not None
+            attempts = 0
+            while attempts < 3:
+                using_saved_password = saved_password is not None
+                if using_saved_password:
+                    password, saved_password = saved_password, None
+                else:
+                    attempts += 1
+                    password = self.password("Vault password (leave empty to cancel): ")
                 if password is None:
                     return False
                 try:
@@ -286,7 +301,13 @@ class DuoAuthenticator:
                     print("Not enough resources to unlock the vault.")
                     return False
                 except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-                    print("Wrong password or damaged vault.")
+                    password = None
+                    if using_saved_password:
+                        print(
+                            "Saved password did not unlock this vault. Enter it manually."
+                        )
+                    else:
+                        print("Wrong password or damaged vault.")
                     continue
 
                 self.config = config
@@ -310,9 +331,11 @@ class DuoAuthenticator:
                     self.wipe(key)
                     key, salt = new_key, new_salt
                     print("Vault security upgraded to DBv2.")
-                password = None
                 self.salt, self.encryption_key = salt, key
                 loaded = True
+                if had_saved_password and not using_saved_password:
+                    self.save_password(password)
+                password = None
                 return True
 
             print("Too many failed password attempts.")
@@ -381,7 +404,76 @@ class DuoAuthenticator:
                 except FileNotFoundError:
                     pass
 
+    def get_password_store(self):
+        if self.password_store is None:
+            self.password_store = PasswordStore(self.config_file)
+        return self.password_store
+
+    def verified_password(self):
+        """Require a typed password for credential-management actions."""
+        password = self.password("Current vault password (leave empty to cancel): ")
+        if password is None:
+            return None
+        key = None
+        try:
+            key = self.derive_v2_key(password, self.salt)
+            if not hmac.compare_digest(key, self.encryption_key):
+                print("Incorrect vault password.")
+                return None
+            return password
+        except (RuntimeError, TypeError):
+            print("Could not verify the vault password.")
+            return None
+        finally:
+            self.wipe(key)
+
+    def save_password(self, password):
+        try:
+            self.get_password_store().save(password)
+            return True
+        except PasswordStoreError:
+            print("Could not securely save the password. Use manual unlock.")
+            # Avoid leaving a stale or partially saved password after an update.
+            try:
+                self.get_password_store().forget()
+            except PasswordStoreError:
+                print(
+                    "Could not clear the saved password. Retry Forget saved password."
+                )
+            return False
+
+    def remember_password(self):
+        print("This OS account will be able to unlock the vault automatically.")
+        password = self.verified_password()
+        if password is not None and self.save_password(password):
+            print("Vault password saved securely on this device.")
+        password = None
+
+    def forget_password(self):
+        try:
+            self.get_password_store().forget()
+        except PasswordStoreError:
+            print(
+                "Could not forget the saved password. Try again when storage is available."
+            )
+            return
+        print("Saved password forgotten. Next launch requires manual unlock.")
+
+    def vault_settings(self):
+        actions = (
+            ("Remember vault password on this device", self.remember_password),
+            ("Forget saved password", self.forget_password),
+            ("Change vault password", self.change_password),
+        )
+        while True:
+            choice = self.menu("Vault settings", *(label for label, _ in actions))
+            if choice is None:
+                return
+            actions[choice - 1][1]()
+
     def change_password(self):
+        if self.verified_password() is None:
+            return
         password = self.password(
             "New vault password (leave empty to cancel): ", confirm=True
         )
@@ -393,7 +485,6 @@ class DuoAuthenticator:
         except RuntimeError:
             print("Not enough resources to change the vault password.")
             return
-        password = None
         try:
             self.save_config(key=key, salt=salt)
         except (OSError, ValueError):
@@ -402,12 +493,24 @@ class DuoAuthenticator:
             return
         self.wipe(self.encryption_key)
         self.salt, self.encryption_key = salt, key
+        try:
+            if self.get_password_store().load() is not None:
+                self.save_password(password)
+        except PasswordStoreError:
+            print("Saved password could not be read; clearing it for manual unlock.")
+            self.forget_password()
+        password = None
         print("Vault password changed.")
 
     @staticmethod
     def parse_activation_url(activation_url):
-        if not activation_url or any(
-            character.isspace() for character in activation_url
+        if (
+            not isinstance(activation_url, str)
+            or not activation_url
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in activation_url
+            )
         ):
             raise ValueError("expected one HTTPS activation URL")
         try:
@@ -421,26 +524,29 @@ class DuoAuthenticator:
             or parsed.username is not None
             or parsed.password is not None
             or port is not None
-            or parsed.query
-            or parsed.fragment
+            or "?" in activation_url
+            or "#" in activation_url
         ):
             raise ValueError("invalid activation URL")
-        host_match = re.fullmatch(r"m-([0-9a-f]{8})\.duosecurity\.com", host)
-        path_match = re.fullmatch(r"/activate/([A-Za-z0-9_-]{20})", parsed.path)
+        host_match = re.fullmatch(r"m-([0-9a-f]+)\.duosecurity\.com", host)
+        path_match = re.fullmatch(r"/activate/([A-Za-z0-9_-]+)", parsed.path)
         if not host_match or not path_match:
             raise ValueError("invalid Duo activation URL")
         return path_match.group(1), f"api-{host_match.group(1)}.duosecurity.com"
 
     def parse_qr_code(self, file_path):
         try:
+            from pyzbar.pyzbar import decode
+
             with Image.open(file_path) as image:
-                decoded = pyzbar_decode(image)
+                decoded = decode(image)
             if len(decoded) != 1:
                 raise ValueError("the image must contain exactly one QR code")
             url = decoded[0].data.decode("utf-8").strip()
             self.parse_activation_url(url)
             return url
         except (
+            ImportError,
             OSError,
             ValueError,
             UnicodeDecodeError,
@@ -485,7 +591,10 @@ class DuoAuthenticator:
                 headers=headers,
                 data=data,
                 timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
             )
+            if response.status_code in range(300, 400):
+                raise ValueError("Duo activation redirected unexpectedly")
             response.raise_for_status()
             payload = response.json()
             activation = payload.get("response") if isinstance(payload, dict) else None
@@ -497,9 +606,15 @@ class DuoAuthenticator:
             return None
 
     def add_key(self):
-        method = self.menu("Add key", "Activation URL (m-HOST.duosecurity.com/activate/PATH)", "Activation code and host", "QR code image")
-        if method is None:
+        methods = {
+            "Activation URL": "url",
+            "Activation code and host": "manual",
+            "QR code image": "qr",
+        }
+        choice = self.menu("Add key", *methods, default=1)
+        if not choice:
             return
+        method = tuple(methods.values())[choice - 1]
 
         while True:
             name = self.ask("Nickname (leave empty to cancel): ")
@@ -510,16 +625,11 @@ class DuoAuthenticator:
             print("That nickname already exists.")
 
         while True:
-            if method == 1:
+            if method == "url":
                 url = self.ask("Activation URL (leave empty to cancel): ")
                 if not url:
                     return
-                match = re.fullmatch(r"https://m-([0-9a-fA-F]+)\.duosecurity\.com/activate/([A-Za-z0-9_-]+)", url)
-                if match is None:
-                    print("Invalid Duo activation URL")
-                    continue
-                host, code = f"api-{match.group(1)}.duosecurity.com", match.group(2)
-            elif method == 2:
+            elif method == "manual":
                 code = self.ask("Activation code (leave empty to cancel): ")
                 if not code:
                     return
@@ -527,19 +637,23 @@ class DuoAuthenticator:
                 if not host:
                     return
                 host = host.lower().removeprefix("https://").rstrip("/")
-                if not re.fullmatch(r"[A-Za-z0-9_-]{20}", code) or not re.fullmatch(
-                    r"api-[0-9a-f]{8}\.duosecurity\.com", host
-                ):
+                host_match = re.fullmatch(r"api-([0-9a-f]+)\.duosecurity\.com", host)
+                if not host_match:
                     print("Invalid Duo activation code or API host. Try again.")
                     continue
-            elif method == 3:
+                url = f"https://m-{host_match.group(1)}.duosecurity.com/activate/{code}"
+            else:
                 file_path = self.ask("QR image path (leave empty to cancel): ")
                 if not file_path:
                     return
                 url = self.parse_qr_code(file_path.strip('"'))
                 if not url:
                     continue
+            try:
                 code, host = self.parse_activation_url(url)
+            except ValueError as error:
+                print(f"Invalid Duo activation URL: {error}")
+                continue
             break
 
         activated = self.activate(code, host)
@@ -609,7 +723,10 @@ class DuoAuthenticator:
             params=data if method == "GET" else None,
             data=data if method == "POST" else None,
             timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
         )
+        if response.status_code in range(300, 400):
+            raise ValueError("Duo request redirected unexpectedly")
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
@@ -645,7 +762,7 @@ class DuoAuthenticator:
         valid_host = (
             isinstance(key, dict)
             and isinstance(key.get("host"), str)
-            and re.fullmatch(r"api-[0-9a-f]{8}\.duosecurity\.com", key["host"].lower())
+            and re.fullmatch(r"api-[0-9a-f]+\.duosecurity\.com", key["host"].lower())
         )
         if (
             not valid_host
@@ -833,7 +950,7 @@ class DuoAuthenticator:
             return
 
         had_counter, had_history = "hotp_counter" in key, "hotp_log" in key
-        old_counter, old_history = key.get("hotp_counter"), key.get("hotp_log")
+        old_counter = key.get("hotp_counter")
         key["hotp_counter"] = next_counter
         if not had_history:
             key["hotp_log"] = history
@@ -875,7 +992,7 @@ class DuoAuthenticator:
             choice = self.menu(
                 "History actions", "Delete older history (keep newest 10)"
             )
-            if choice == 0:
+            if not choice:
                 return
             if choice == 1:
                 if len(history) <= 10:
@@ -894,7 +1011,26 @@ class DuoAuthenticator:
                         key["hotp_log"] = old_history
                         print("Could not save the history change.")
 
+    def delete_key(self, name):
+        if self.ask(
+            f"Delete '{name}' locally? This does not revoke it in Duo. [y/N]: "
+        ) not in ("y", "Y"):
+            return
+        deleted = self.config["keys"].pop(name)
+        try:
+            self.save_config()
+            print(f"Key '{name}' deleted.")
+        except (OSError, ValueError):
+            self.config["keys"][name] = deleted
+            print("Could not save the deletion.")
+
     def keys_menu(self):
+        actions = {
+            "Duo Mobile Push / Verified Duo Push": self.push_loop,
+            "Generate Duo Mobile Passcode": self.generate_passcode,
+            "Duo Mobile Passcode history": self.passcode_history,
+            "Delete local key": self.delete_key,
+        }
         while True:
             names = list(self.config["keys"])
             if not names:
@@ -910,52 +1046,28 @@ class DuoAuthenticator:
                     else None
                 )
                 labels.append(name + (f" ({organization})" if organization else ""))
-            choice = self.menu("Keys", *labels)
-            if choice == 0:
+            choice = self.menu("Keys", *labels, default=1)
+            if not choice:
                 return
             name = names[choice - 1]
 
             while name in self.config["keys"]:
-                action = self.menu(
-                    name,
-                    "Duo Mobile Push / Verified Duo Push",
-                    "Generate Duo Mobile Passcode",
-                    "Duo Mobile Passcode history",
-                    "Delete key",
-                )
-                if action == 0:
+                choice = self.menu(name, *actions, default=1)
+                if not choice:
                     break
-                if action == 1:
-                    self.push_loop(name)
-                elif action == 2:
-                    self.generate_passcode(name)
-                elif action == 3:
-                    self.passcode_history(name)
-                elif action == 4:
-                    if self.ask(f"Delete '{name}'? [y/N]: ") not in ("y", "Y"):
-                        continue
-                    deleted = self.config["keys"].pop(name)
-                    try:
-                        self.save_config()
-                        print(f"Key '{name}' deleted.")
-                    except (OSError, ValueError):
-                        self.config["keys"][name] = deleted
-                        print("Could not save the deletion.")
-                    break
+                tuple(actions.values())[choice - 1](name)
 
     def main_menu(self):
+        actions = {
+            "Keys": self.keys_menu,
+            "Add key": self.add_key,
+            "Vault settings": self.vault_settings,
+        }
         while True:
-            choice = self.menu(
-                "Main menu", "Keys", "Add key", "Change vault password", back="Exit"
-            )
-            if choice is None or choice == 0:
+            choice = self.menu("Main menu", *actions, back="Exit", default=1)
+            if not choice:
                 return
-            elif choice == 1:
-                self.keys_menu()
-            elif choice == 2:
-                self.add_key()
-            elif choice == 3:
-                self.change_password()
+            tuple(actions.values())[choice - 1]()
 
     def close(self):
         lock_file, self.lock_file = self.lock_file, None
