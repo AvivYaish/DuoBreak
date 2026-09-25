@@ -445,10 +445,7 @@ class PushListener:
             self._stop.set()
         deadline = monotonic() + 1
         for worker in self._threads:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                break
-            worker.join(remaining)
+            worker.join(max(0, deadline - monotonic()))
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
@@ -478,6 +475,10 @@ class DuoAuthenticator:
             if self.display is None:
                 print()
             return None
+
+    def confirm(self, prompt, *, default=False):
+        answer = self.ask(f"{prompt} [{'Y/n' if default else 'y/N'}]: ")
+        return answer is not None and (answer.lower() != "n" if default else answer.lower() == "y")
 
     @staticmethod
     def menu(title, *options, back="Back", default=None):
@@ -525,14 +526,14 @@ class DuoAuthenticator:
             callbacks[choice - 1]()
 
     @staticmethod
-    def password(prompt, confirm=False):
+    def password(prompt, confirm=False, *, min_length=12):
         try:
             while True:
                 password = getpass.getpass(prompt)
                 if not password or not confirm:
                     return password or None
-                if len(password) < 12:
-                    print("Use at least 12 characters for the vault password.")
+                if len(password) < min_length:
+                    print(f"Use at least {min_length} characters for the vault password.")
                     continue
                 if password == getpass.getpass("Confirm password: "):
                     return password
@@ -616,9 +617,8 @@ class DuoAuthenticator:
             cipher.update(blob[:36])
             plaintext = bytearray(cipher.decrypt_and_verify(blob[52:], blob[36:52]))
             config = json.loads(plaintext.decode("utf-8"))
-            if not isinstance(config, dict) or not isinstance(config.get("keys", {}), dict):
+            if not isinstance(config, dict) or not isinstance(config.setdefault("keys", {}), dict):
                 raise ValueError("Invalid vault data")
-            config.setdefault("keys", {})
             return config, key, salt
         except BaseException:
             self.wipe(key)
@@ -984,8 +984,7 @@ class DuoAuthenticator:
             return
 
         while not (activated := self.activate(code, host)):
-            retry = self.ask("Retry this activation? [Y/n]: ")
-            if retry is None or retry.lower() == "n":
+            if not self.confirm("Retry this activation?", default=True):
                 return
 
         response, public_key, private_key = activated
@@ -998,8 +997,7 @@ class DuoAuthenticator:
         }
         while not self.save_changes(self.config["keys"], {name: key}):
             print("Save failed. This activation may be one-use, leaving permanently discards it.")
-            retry = self.ask("Retry saving? [Y/n]: ")
-            if retry is None or retry.lower() == "n":
+            if not self.confirm("Retry saving?", default=True):
                 print("The activated key was not saved.")
                 return
         print(f"Key '{name}' added.")
@@ -1385,16 +1383,35 @@ class DuoAuthenticator:
             if len(history) <= 10:
                 print("There is no older history to delete.")
                 continue
-            if self.ask(f"Delete {len(history) - 10} older entries? [y/N]: ") not in (
-                "y",
-                "Y",
-            ):
+            if not self.confirm(f"Delete {len(history) - 10} older entries?"):
                 continue
             if self.save_changes(key, {"hotp_log": history[-10:]}):
                 history = key["hotp_log"]
                 print("Older passcode history deleted.")
             else:
                 print("Could not save the history change.")
+
+    def set_key_password(self, name):
+        key = self.config["keys"][name]
+        if not isinstance(key, dict):
+            print("Invalid key data.")
+            return
+        password = self.password("Key password (blank to cancel): ", confirm=True, min_length=0)
+        if password is None:
+            return
+        saved = self.save_changes(self.config["keys"], {name: dict(key, password=password)})
+        print("Password saved." if saved else "Could not save the password.")
+
+    def forget_key_password(self, name):
+        key = self.config["keys"][name]
+        if not isinstance(key, dict) or "password" not in key:
+            print("No password saved for this key.")
+            return
+        if not self.confirm(f"Forget the password for '{name}'?"):
+            return
+        updated = {field: value for field, value in key.items() if field != "password"}
+        saved = self.save_changes(self.config["keys"], {name: updated})
+        print("Password forgotten." if saved else "Could not remove the password.")
 
     def rename_key(self, name):
         keys = self.config["keys"]
@@ -1428,16 +1445,11 @@ class DuoAuthenticator:
             print("Could not save passcode visibility.")
 
     def delete_key(self, name):
-        if self.ask(f"Delete '{name}' locally? This does not revoke it in Duo. [y/N]: ") not in (
-            "y",
-            "Y",
-        ):
+        if not self.confirm(f"Delete '{name}' locally? This does not revoke it in Duo."):
             return
         remaining = {n: key for n, key in self.config["keys"].items() if n != name}
-        if self.save_changes(self.config, {"keys": remaining}):
-            print(f"Key '{name}' deleted.")
-        else:
-            print("Could not save the deletion.")
+        saved = self.save_changes(self.config, {"keys": remaining})
+        print(f"Key '{name}' deleted." if saved else "Could not save the deletion.")
 
     def keys_menu(self):
         actions = {
@@ -1448,6 +1460,8 @@ class DuoAuthenticator:
             "Rename key": self.rename_key,
             "Export OTP secret to KeePass": self.export_secret,
             "Show/hide passcode": self.toggle_passcode_visibility,
+            "Set key password": self.set_key_password,
+            "Forget key password": self.forget_key_password,
         }
         while True:
             keys = list(self.config["keys"].items())
@@ -1497,34 +1511,43 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Show passcodes and listen for pushes. Press m to open the menu."
     )
-    parser.add_argument("-k", dest="key", metavar="KEYNAME", help="print this key's OTP and exit")
+    options = parser.add_mutually_exclusive_group()
+    options.add_argument("-k", dest="key", metavar="KEYNAME", help="print this key's OTP and exit")
+    options.add_argument(
+        "-p", dest="password", metavar="KEYNAME", help="print this key's saved password and exit"
+    )
     args = parser.parse_args(argv)
+    name = args.key if args.key is not None else args.password
     output = sys.stdout
     with (
         closing(DuoAuthenticator()) as app,
-        redirect_stdout(sys.stderr if args.key is not None else output),
+        redirect_stdout(sys.stderr if name is not None else output),
     ):
         try:
             if not (
-                (app.config_file or app.select_vault(create=args.key is None)) and app.load_config()
+                (app.config_file or app.select_vault(create=name is None)) and app.load_config()
             ):
                 return 1
-            if args.key is None:
+            if name is None:
                 app.run_default()
-            else:
-                if args.key not in app.config["keys"]:
-                    print(f"Unknown key: {args.key}")
+                return 0
+            if name not in app.config["keys"]:
+                print(f"Unknown key: {name}")
+                return 1
+            if args.password is not None:
+                key = app.config["keys"][name]
+                value = key.get("password") if isinstance(key, dict) else None
+                if not isinstance(value, str) or not value:
+                    print(f"No password saved for key: {name}")
                     return 1
-                kind, value = app.make_passcode(args.key)
+            else:
+                kind, value = app.make_passcode(name)
                 if not kind:
                     print(value)
                     return 1
-                code = (
-                    value.at(datetime.fromtimestamp(time.time(), timezone.utc))
-                    if kind == "TOTP"
-                    else value
-                )
-                print(code, file=output)
+                if kind == "TOTP":
+                    value = value.at(datetime.fromtimestamp(time.time(), timezone.utc))
+            print(value, file=output)
             return 0
         except (KeyboardInterrupt, EOFError):
             print("\nExited safely.")
