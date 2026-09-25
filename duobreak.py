@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from collections import deque
-from contextlib import closing, suppress
+from contextlib import closing, redirect_stdout, suppress
 from copy import deepcopy
 from datetime import datetime, timezone
 from email.utils import format_datetime
@@ -558,11 +558,14 @@ class DuoAuthenticator:
             return None
         return name if name.lower().endswith(".duo") else name + ".duo"
 
-    def select_vault(self):
-        vaults = sorted(
-            (path for path in Path.cwd().glob("*.duo") if path.is_file()),
-            key=lambda path: path.name.lower(),
-        )
+    def select_vault(self, *, create=True):
+        for directory in (Path.cwd(), Path(__file__).resolve().parent):
+            vaults = sorted(
+                (path for path in directory.glob("*.duo") if path.is_file()),
+                key=lambda path: path.name.lower(),
+            )
+            if vaults:
+                break
         if vaults:
             choice = 1
             if len(vaults) > 1:
@@ -572,6 +575,9 @@ class DuoAuthenticator:
             self.config_file = vaults[choice - 1]
             return True
 
+        if not create:
+            print("No Duo vault found.")
+            return False
         print("No Duo vault found. Create one to continue.")
         while name := self.ask("Vault name (leave empty to exit): "):
             if filename := self.vault_filename(name):
@@ -1488,16 +1494,42 @@ class DuoAuthenticator:
 
 
 def main(argv=None):
-    argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Show passcodes and listen for pushes. Press m to open the menu."
-    ).parse_args(argv)
-    with closing(DuoAuthenticator()) as app:
+    )
+    parser.add_argument("-k", dest="key", metavar="KEYNAME", help="print this key's OTP and exit")
+    args = parser.parse_args(argv)
+    output = sys.stdout
+    with (
+        closing(DuoAuthenticator()) as app,
+        redirect_stdout(sys.stderr if args.key is not None else output),
+    ):
         try:
-            if (app.config_file or app.select_vault()) and app.load_config():
+            if not (
+                (app.config_file or app.select_vault(create=args.key is None)) and app.load_config()
+            ):
+                return 1
+            if args.key is None:
                 app.run_default()
+            else:
+                if args.key not in app.config["keys"]:
+                    print(f"Unknown key: {args.key}")
+                    return 1
+                kind, value = app.make_passcode(args.key)
+                if not kind:
+                    print(value)
+                    return 1
+                code = (
+                    value.at(datetime.fromtimestamp(time.time(), timezone.utc))
+                    if kind == "TOTP"
+                    else value
+                )
+                print(code, file=output)
+            return 0
         except (KeyboardInterrupt, EOFError):
             print("\nExited safely.")
+            return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
