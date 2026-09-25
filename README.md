@@ -2,7 +2,7 @@
 
 Forked from [JesseNaser's repo](https://github.com/JesseNaser/DuoBreak).
 
-Supports push authorization, auto-refreshing passcodes, and securely storing vault password locally.
+Supports push authorization, auto-refreshing passcodes, exporting OTP secrets to other programs, and securely storing vault password locally.
 
 <p align="center">
 <img width="400" height="186" alt="Live push notification." src="https://github.com/user-attachments/assets/e6a9cd48-2ad6-4910-a627-c68464010999" /><br/>
