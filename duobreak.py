@@ -876,6 +876,8 @@ class DuoAuthenticator:
                     return
 
     def duo_request(self, key_config, method, path, data):
+        # Duo verifies a canonical, alphabetically sorted parameter string.
+        data = dict(sorted(data.items()))
         private_key = RSA.import_key(key_config["privkey"].encode("ascii"))
         duo_date = email.utils.format_datetime(
             datetime.datetime.now(datetime.timezone.utc)
@@ -915,11 +917,43 @@ class DuoAuthenticator:
         )
         if response.status_code in range(300, 400):
             raise ValueError("Duo request redirected unexpectedly")
+        if method == "POST" and response.status_code == 400:
+            with suppress(ValueError):
+                rejection = response.json()
+                if (
+                    isinstance(rejection, dict)
+                    and rejection.get("stat") == "FAIL"
+                    and str(rejection.get("code")) == "40032"
+                ):
+                    return {"stat": "FAIL", "code": 40032}
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
             raise ValueError("Invalid Duo response")
         return result
+
+    @staticmethod
+    def request_error(error):
+        """Describe failures without printing request URLs, headers, or bodies."""
+        if isinstance(error, requests.HTTPError) and error.response is not None:
+            response = error.response
+            detail = f"HTTP {response.status_code}"
+            with suppress(ValueError):
+                payload = response.json()
+                code = str(payload.get("code", "")) if isinstance(payload, dict) else ""
+                if re.fullmatch(r"[0-9]{5}", code):
+                    detail += f" (Duo {code})"
+            return detail
+        for kind, detail in (
+            (requests.Timeout, "request timed out"),
+            (requests.exceptions.SSLError, "TLS connection failed"),
+            (requests.ConnectionError, "connection failed"),
+            (requests.exceptions.JSONDecodeError, "invalid JSON response"),
+            ((ValueError, KeyError, TypeError), "invalid request or response data"),
+        ):
+            if isinstance(error, kind):
+                return detail
+        return "request failed"
 
     @classmethod
     def prompt_step_up_code(cls, step_up_code_info, key_name=None):
@@ -1072,12 +1106,19 @@ class DuoAuthenticator:
                     reply_data.update(
                         step_up_code=code, step_up_code_autofilled="false"
                     )
-                reply = self.duo_request(
-                    key,
-                    "POST",
-                    "/push/v2/device/transactions/" + transaction_id,
-                    reply_data,
-                )
+                try:
+                    reply = self.duo_request(
+                        key,
+                        "POST",
+                        "/push/v2/device/transactions/" + transaction_id,
+                        reply_data,
+                    )
+                except PUSH_ERRORS as error:
+                    print(
+                        f"[{key_name}] {push_name} approval could not be confirmed: "
+                        f"{self.request_error(error)}. Still listening."
+                    )
+                    return True
                 if reply.get("stat") == "OK":
                     print(f"[{key_name}] {push_name} approved.")
                     break
@@ -1140,8 +1181,8 @@ class DuoAuthenticator:
                             name, keys[name], result, handled[name], listener.is_pending
                         ):
                             return
-                    except PUSH_ERRORS:
-                        print(f"[{name}] Mobile push check failed, retrying.")
+                    except PUSH_ERRORS as error:
+                        print(f"[{name}] Mobile push check failed: {self.request_error(error)}, retrying.")
         except (KeyboardInterrupt, EOFError):
             print("\nStopped checking for mobile pushes.")
 
