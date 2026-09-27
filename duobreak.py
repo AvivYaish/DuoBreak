@@ -11,12 +11,11 @@ import importlib
 import json
 import os
 import re
-import stat
 import sys
 import tempfile
 import time
 from collections import deque
-from contextlib import closing, redirect_stdout, suppress
+from contextlib import closing, contextmanager, redirect_stdout, suppress
 from copy import deepcopy
 from datetime import datetime, timezone
 from email.utils import format_datetime
@@ -35,15 +34,17 @@ from Crypto.Protocol.KDF import scrypt
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
 from Crypto.Signature import pkcs1_15
+from keyring.errors import PasswordDeleteError
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import DummyHistory
 from prompt_toolkit.input import create_input
 from prompt_toolkit.input.typeahead import get_typeahead
-from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.output.defaults import create_output
-from prompt_toolkit.shortcuts import choice
 from prompt_toolkit.utils import is_dumb_terminal
+from questionary import Choice, select
 
 DB_V2 = b"DBv2"  # Authenticated AES-SIV with scrypt.
 SALT_SIZE = NONCE_SIZE = TAG_SIZE = 16
@@ -61,7 +62,25 @@ VAULT_CHANGED = "Vault was changed by another process"
 INVALID_KEY = "Invalid key data."
 CONNECTION_FAILED = "connection failed"
 LISTENING = "Listening for pushes ({} keys)"
-LISTEN_HINTS = ("- Enter: refresh passcodes", "- m: menu", "- Ctrl+C: stop")
+LISTEN_HINTS = ("- Enter: refresh passcodes", "- m: menu", "- Backspace: exit", "- Ctrl+C: stop")
+
+
+def menu_prompt(title, *options, back="Back", default=None, back_value=0, **settings):
+    if default is not None and not 1 <= default <= len(options):
+        raise ValueError("The default must identify a menu option")
+    choices = [Choice(label, value=value) for value, label in [*enumerate(options, 1), (0, back)]]
+    back_action = options[back_value - 1] if back_value else back
+    question = select(
+        title, choices=choices, default=default or 0,
+        instruction=f"(Arrows: move, Enter: select, Backspace: {back_action})",
+        use_shortcuts=len(choices) <= 36, use_jk_keys=False, **settings,
+    )
+
+    @question.application.key_bindings.add(Keys.Backspace, eager=True)
+    def go_back(event):
+        event.app.exit(result=back_value)
+
+    return question
 
 
 class EnterInput:
@@ -85,6 +104,8 @@ class EnterInput:
                 raise error
             if key in ("m", "M"):
                 return "menu"
+            if key == Keys.Backspace:
+                return "stop"
             if key == Keys.Enter or (key == Keys.ControlJ and previous != Keys.Enter):
                 return True
         return False
@@ -95,8 +116,8 @@ class EnterInput:
 
     def get(self, listener):
         refresh = self()
-        if refresh == "menu":
-            return "menu"
+        if refresh in ("menu", "stop"):
+            return refresh
         step = int(time.time()) // 30
         if not refresh and step != self.step:
             timed = {name: row for name, row in self.codes.items() if row[0] == "TOTP"}
@@ -110,6 +131,7 @@ class LiveDisplay:
 
     def __init__(self, title):
         self.title, self.codes, self.status, self.poll_errors, self.count = title, {}, "", {}, 0
+        self.question = None
         self.session = PromptSession(
             output=create_output(),
             input=create_input(),
@@ -119,27 +141,15 @@ class LiveDisplay:
         )
 
     def render(self, prompt=""):
-        rows = [
-            f"Vault: {self.title}",
-            *passcode_lines(self.codes),
-            "",
-            LISTENING.format(self.count),
-            *(LISTEN_HINTS[-1:] if prompt else LISTEN_HINTS),
-        ]
-        if self.status:
-            rows.extend(("", self.status))
-        if self.poll_errors:
-            rows.extend(("", *self.poll_errors.values()))
-        return "\n".join(rows) + "\n" + prompt
+        sections = (
+            "\n".join((f"Vault: {self.title}", *passcode_lines(self.codes))),
+            "\n".join((LISTENING.format(self.count), *(LISTEN_HINTS[-1:] if prompt else ()))),
+            self.status,
+            "\n".join(self.poll_errors.values()),
+        )
+        return "\n\n".join(filter(None, sections)) + "\n" + prompt
 
     def get(self, listener):
-        bindings = KeyBindings()
-
-        @bindings.add("m")
-        @bindings.add("M")
-        def menu(event):
-            event.app.exit(result="menu")
-
         def poll(app):
             if app.is_done:
                 return
@@ -150,13 +160,22 @@ class LiveDisplay:
             except Exception as error:
                 app.exit(exception=error)
 
-        self.session.app.before_render += poll
-        try:
-            result = self.session.prompt(self.render, key_bindings=bindings)
-            return result if result == "menu" or isinstance(result, tuple) else None
-        finally:
-            self.session.app.before_render -= poll
-            self.session.key_bindings = None
+        if self.question is None:
+            self.question = menu_prompt(
+                "Passcode screen", "Refresh passcodes", "Main menu", back="Exit", default=1,
+                input=self.session.app.input, output=self.session.app.output,
+                refresh_interval=self.session.refresh_interval, erase_when_done=True,
+            )
+            app = self.question.application
+            app.layout.container = HSplit([
+                Window(FormattedTextControl(self.render), dont_extend_height=True), app.layout.container,
+            ])
+            app.before_render += poll
+        result = self.question.unsafe_ask()
+        if isinstance(result, tuple):
+            return result  # Keep the highlighted action when polling redraws the menu.
+        self.question = None
+        return ("stop", None, "menu")[result]
 
     def _discard_input(self):
         # Input intended for a previous screen shouldn't approve new pushes.
@@ -171,6 +190,7 @@ class LiveDisplay:
         return self.session.prompt(lambda: self.render(prompt), pre_run=self._discard_input)
 
     def close(self):
+        self.question = None
         self.codes.clear()
         self.status = ""
         self.poll_errors.clear()
@@ -183,115 +203,63 @@ class PasswordStoreError(RuntimeError):
     """Native password storage failed."""
 
 
-def _local_data_dir(platform):
-    home = Path.home()
-    if platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-    elif platform == "darwin":
-        base = home / "Library" / "Application Support"
-    elif platform.startswith("linux"):
-        base = Path(os.environ.get("XDG_STATE_HOME", ""))
-        if not base.is_absolute():
-            base = home / ".local" / "state"
-    else:
-        raise PasswordStoreError(UNSUPPORTED_STORAGE)
-    if not base.is_absolute():
-        raise PasswordStoreError("Password storage requires an absolute path.")
-    return base / "DuoBreak" / "passwords"
-
-
 class PasswordStore:
-    """Lazily access a native store identified by the canonical vault path."""
+    """Lazily use an OS keyring, separate from the original client's storage."""
 
-    def __init__(self, vault_path, *, data_dir=None, platform=None):
+    service = "DuoBreak vault passwords (keyring)"
+
+    def __init__(self, vault_path, *, platform=None):
         self._platform = platform or sys.platform
-        self._data_dir = Path(data_dir) if data_dir is not None else None
         canonical_path = os.path.normcase(str(Path(vault_path).expanduser().resolve()))
         self._identity = hashlib.sha256(os.fsencode(canonical_path)).hexdigest()
 
-    @property
-    def location(self):
-        """DPAPI blob on Windows, nonsecret keyring signal on macOS/Linux."""
-        directory = self._data_dir or _local_data_dir(self._platform)
-        return directory / (self._identity + ".bin")
-
-    def _open(self):
+    @contextmanager
+    def _open(self, error_message):
+        platform = "linux" if self._platform.startswith("linux") else self._platform
+        backends = {
+            "win32": ("Windows", "WinVaultKeyring"),
+            "darwin": ("macOS", "Keyring"),
+            "linux": ("SecretService", "Keyring"),
+        }
+        if platform not in backends:
+            raise PasswordStoreError(UNSUPPORTED_STORAGE)
         try:
-            persistence = importlib.import_module("msal_extensions.persistence")
-            location = self.location
-            location.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if self._platform == "win32":
-                backend = persistence.FilePersistenceWithDataProtection(str(location))
-            elif self._platform == "darwin":
-                backend = persistence.KeychainPersistence(
-                    str(location),
-                    service_name="DuoBreak vault passwords",
-                    account_name=self._identity,
-                )
-            elif self._platform.startswith("linux"):
-                backend = persistence.LibsecretPersistence(
-                    str(location),
-                    schema_name="org.duobreak.vault-password",
-                    attributes={"vault": self._identity},
-                    label="DuoBreak vault password",
-                )
-            else:
-                raise PasswordStoreError(UNSUPPORTED_STORAGE)
-            if backend.is_encrypted is not True:
-                raise PasswordStoreError("Refusing unencrypted password storage.")
-            return backend, persistence.PersistenceNotFound
-        except PasswordStoreError:
+            module, name = backends[platform]
+            backend = getattr(importlib.import_module(f"keyring.backends.{module}"), name)()
+            if platform == "win32":
+                backend.persist = "local machine"
+        except EOFError:
             raise
-        except ImportError:
-            raise PasswordStoreError("Secure storage unavailable, check msal-extensions and your OS keyring.") from None
         except Exception:
             raise PasswordStoreError("OS secure storage unavailable. Unlock manually.") from None
+        try:
+            yield backend
+        except EOFError:
+            raise
+        except Exception:
+            raise PasswordStoreError(error_message) from None
 
     def load(self):
-        """Missing signal or secret means no auto-unlock, backend errors raise."""
-        try:
-            if not stat.S_ISREG(self.location.stat().st_mode):
-                raise OSError
-        except FileNotFoundError:
-            return None
-        except OSError:
-            raise PasswordStoreError("Cannot access local password storage.") from None
-        backend, not_found = self._open()
-        try:
-            password = backend.load()
-            if not isinstance(password, str):
+        with self._open("Cannot read saved password. Unlock manually.") as backend:
+            password = backend.get_password(self.service, self._identity)
+            if password is not None and not isinstance(password, str):
                 raise TypeError
             return password or None
-        except not_found:
-            return None
-        except Exception:
-            raise PasswordStoreError("Cannot read saved password. Unlock manually.") from None
 
     def save(self, password):
         if not isinstance(password, str) or not password:
             raise PasswordStoreError("Password must be a nonempty string.")
-        self._write(password, "save")
-
-    def _write(self, password, action):
-        backend, _ = self._open()
-        try:
-            backend.save(password)
-            # Libsecret can fail silently, verify both saves and empty tombstones.
-            if backend.load() != password:
+        with self._open("Cannot save and verify the password in OS secure storage.") as backend:
+            backend.set_password(self.service, self._identity, password)
+            if backend.get_password(self.service, self._identity) != password:
                 raise ValueError
-        except Exception:
-            raise PasswordStoreError(
-                f"Cannot {action} and verify the password in OS secure storage."
-            ) from None
 
     def forget(self):
-        """Remove the DPAPI blob, replace native-keyring secrets with empty text."""
-        if self._platform != "win32":
-            return self._write("", "clear")
-        try:
-            self.location.unlink(missing_ok=True)
-        except OSError:
-            raise PasswordStoreError("Cannot remove saved password.") from None
+        with self._open("Cannot remove saved password.") as backend:
+            with suppress(PasswordDeleteError):
+                backend.delete_password(self.service, self._identity)
+            if backend.get_password(self.service, self._identity) is not None:
+                raise ValueError
 
 
 def key_otp(key):
@@ -456,52 +424,18 @@ class DuoAuthenticator:
         return answer is not None and (answer.lower() != "n" if default else answer.lower() == "y")
 
     @staticmethod
-    def menu(title, *options, back="Back", default=None):
+    def menu(*args, **kwargs):
         """Return 1..N for an option, or None for Back/cancellation."""
-        if default is not None and not 1 <= default <= len(options):
-            raise ValueError("The default must identify a menu option")
-        bindings = KeyBindings()
-
-        @bindings.add("up", eager=True)
-        @bindings.add("down", eager=True)
-        def move(event):
-            control = event.app.layout.current_control
-
-            def position():
-                # Read fresh fragments to handle several keys between redraws.
-                return next(i for i, fragment in enumerate(control.text())
-                            if fragment[0] == "[SetCursorPosition]")
-
-            previous = position()
-            key = event.key_sequence[-1].key
-            native = control.get_key_bindings()
-            native.get_bindings_for_keys((key,))[-1].call(event)
-            if position() == previous:
-                opposite = Keys.Down if key == Keys.Up else Keys.Up
-                step = native.get_bindings_for_keys((opposite,))[-1]
-                for _ in options:
-                    step.call(event)
-
         with suppress(EOFError, KeyboardInterrupt):
-            return choice(
-                title,
-                options=[*enumerate(options, 1), (0, back)],
-                default=default or 0,
-                key_bindings=bindings,
-            ) or None
-
-    def action_menu(self, title, actions, **options):
-        callbacks = tuple(actions.values())
-        while choice := self.menu(title, *actions, **options):
-            callbacks[choice - 1]()
+            return menu_prompt(*args, **kwargs).unsafe_ask() or None
 
     @staticmethod
-    def password(prompt, confirm=False, *, min_length=12):
+    def password(prompt, confirm=False, *, min_length=12, allow_empty=False):
         with suppress(EOFError, KeyboardInterrupt):
             while True:
                 password = getpass.getpass(prompt)
                 if not password or not confirm:
-                    return password or None
+                    return password if password or allow_empty else None
                 if len(password) < min_length:
                     print(f"Use at least {min_length} characters for the vault password.")
                     continue
@@ -613,7 +547,7 @@ class DuoAuthenticator:
             return False
         loaded = False
         try:
-            path = Path(self.config_file)
+            path = self.config_file
             if not path.exists():
                 password = self.password(
                     "Create a vault password (leave empty to cancel): ", confirm=True
@@ -696,7 +630,7 @@ class DuoAuthenticator:
             ciphertext, tag = cipher.encrypt_and_digest(plaintext)
             encrypted = header + tag + ciphertext
 
-            path = Path(self.config_file)
+            path = self.config_file
             try:
                 current_digest = hashlib.sha256(path.read_bytes()).digest()
             except FileNotFoundError:
@@ -772,21 +706,20 @@ class DuoAuthenticator:
         print("Saved password forgotten. Next launch requires manual unlock.")
 
     def vault_settings(self):
-        self.action_menu(
-            "Vault settings",
-            {
-                "Rename vault": self.rename_vault,
-                "Remember vault password on this device": self.remember_password,
-                "Forget saved password": self.forget_password,
-                "Change vault password": self.change_password,
-            },
-        )
+        actions = {
+            "Rename vault": self.rename_vault,
+            "Remember vault password on this device": self.remember_password,
+            "Forget saved password": self.forget_password,
+            "Change vault password": self.change_password,
+        }
+        while choice := self.menu("Vault settings", *actions):
+            tuple(actions.values())[choice - 1]()
 
     def rename_vault(self):
         name = self.vault_filename(self.ask("New vault name (empty to cancel): "))
         if not name:
             return
-        source = Path(self.config_file)
+        source = self.config_file
         target = source.with_name(name)
         if os.path.normcase(str(source.absolute())) == os.path.normcase(str(target.absolute())):
             return
@@ -968,9 +901,7 @@ class DuoAuthenticator:
         signature = base64.b64encode(pkcs1_15.new(private_key).sign(SHA512.new(message))).decode(
             "ascii"
         )
-        credentials = f"{key['response']['pkey']}:{signature}".encode("ascii")
         headers = {
-            "Authorization": "Basic " + base64.b64encode(credentials).decode("ascii"),
             "x-duo-date": duo_date,
             "host": key["host"],
         }
@@ -979,6 +910,7 @@ class DuoAuthenticator:
         response = requests.request(
             method,
             f"https://{key['host']}{path}",
+            auth=(key["response"]["pkey"], signature),
             headers=headers,
             params=data if method == "GET" else None,
             data=data if method == "POST" else None,
@@ -1156,9 +1088,6 @@ class DuoAuthenticator:
             handled.add(transaction_id)
         return True
 
-    def push_loop(self, key_name):
-        self.listen_for_pushes([key_name])
-
     def generate_passcodes(self):
         self.passcodes.clear()
         for name, key in list(self.config["keys"].items()):
@@ -1166,25 +1095,27 @@ class DuoAuthenticator:
                 self.passcodes[name] = self.make_passcode(name)
         if self.display is None:
             print(
-                f"\nVault: {Path(self.config_file).name if self.config_file else '(unsaved)'}",
+                f"\nVault: {self.config_file.name if self.config_file else '(unsaved)'}",
                 *passcode_lines(self.passcodes),
                 sep="\n",
             )
 
-    def listen_for_pushes(self, key_names, *, generate_passcodes=False):
+    def passcode_screen(self):
+        if not self.config["keys"]:
+            print("No keys saved.")
+            return "menu"
         keys = {
-            name: key for name in key_names if (key := self.validated_push_key(name)) is not None
+            name: key for name in self.config["keys"] if (key := self.validated_push_key(name)) is not None
         }
         handled = {name: set() for name in keys}
         failures, poll_errors = set(), {}
-        self.passcodes.clear()
         if (
             sys.stdin.isatty()
             and sys.stdout.isatty()
             and (sys.platform == "win32" or not is_dumb_terminal())
         ):
             self.display = LiveDisplay(
-                Path(self.config_file).name if self.config_file else "(unsaved)"
+                self.config_file.name if self.config_file else "(unsaved)"
             )
             self.display.count = len(keys)
             self.display.poll_errors = poll_errors
@@ -1194,12 +1125,11 @@ class DuoAuthenticator:
                 PushListener(keys, self.poll_pushes, interval=POLL_SECONDS) as listener,
             ):
                 keyboard.codes = self.passcodes
-                if generate_passcodes:
-                    self.generate_passcodes()
+                self.generate_passcodes()
                 if not keys:
                     self.say("No keys support mobile push.")
                     if not any(kind for kind, _ in self.passcodes.values()):
-                        return "menu" if generate_passcodes else None
+                        return "menu"
                 if self.display is None:
                     print(
                         "\n" + LISTENING.format(len(keys)),
@@ -1211,8 +1141,8 @@ class DuoAuthenticator:
                         update = keyboard.get(listener)
                     except Empty:
                         continue
-                    if update == "menu":
-                        return "menu"
+                    if update in ("menu", "stop"):
+                        return "menu" if update == "menu" else None
                     if update is None:
                         self.generate_passcodes()
                         continue
@@ -1246,20 +1176,8 @@ class DuoAuthenticator:
             self.passcodes.clear()
 
     def run_default(self):
-        if self.passcode_screen() == "menu":
-            self.main_menu()
-
-    def passcode_screen(self):
-        names = list(self.config["keys"])
-        if not names:
-            print("No keys saved.")
-            return "menu"
-        return self.listen_for_pushes(names, generate_passcodes=True)
-
-    def generate_passcode(self, key_name):
-        self.passcodes[key_name] = self.make_passcode(key_name)
-        if self.display is None:
-            print(*passcode_lines({key_name: self.passcodes[key_name]}), sep="\n")
+        while self.passcode_screen() == "menu" and self.main_menu():
+            pass
 
     def save_changes(self, mapping, changes):
         """Save an update, restoring the original objects if the write fails."""
@@ -1347,32 +1265,26 @@ class DuoAuthenticator:
         if not isinstance(key, dict):
             print(INVALID_KEY)
             return
-        password = self.password("Key password (blank to cancel): ", confirm=True, min_length=0)
+        password = self.password(
+            "Key password (blank to remove, Ctrl+C to cancel): ",
+            confirm=True, min_length=0, allow_empty=True,
+        )
         if password is None:
             return
-        saved = self.save_changes(self.config["keys"], {name: dict(key, password=password)})
-        print("Password saved." if saved else "Could not save the password.")
-
-    def forget_key_password(self, name):
-        key = self.config["keys"][name]
-        if not isinstance(key, dict) or "password" not in key:
-            print("No password saved for this key.")
-            return
-        if not self.confirm(f"Forget the password for '{name}'?"):
-            return
         updated = {field: value for field, value in key.items() if field != "password"}
-        saved = self.save_changes(self.config["keys"], {name: updated})
-        print("Password forgotten." if saved else "Could not remove the password.")
+        if password:
+            updated["password"] = password
+        if self.save_changes(self.config["keys"], {name: updated}):
+            print("Password saved." if password else "Password removed.")
+        else:
+            print("Could not save the password change.")
 
     def rename_key(self, name):
         keys = self.config["keys"]
-        while True:
-            new_name = self.ask(f"New name for '{name}' (blank to cancel): ")
-            if not new_name or new_name == name:
-                return
-            if new_name not in keys:
-                break
+        while (new_name := self.ask(f"New name for '{name}' (blank to cancel): ")) and new_name != name and new_name in keys:
             print("A key with that name already exists.")
+        if not new_name or new_name == name:
+            return
         renamed = {
             new_name if old_name == name else old_name: key for old_name, key in keys.items()
         }
@@ -1404,15 +1316,12 @@ class DuoAuthenticator:
 
     def keys_menu(self):
         actions = {
-            "Duo Mobile Push / Verified Duo Push": self.push_loop,
-            "Generate Duo Mobile Passcode": self.generate_passcode,
             "Duo Mobile Passcode history": self.passcode_history,
             "Delete local key": self.delete_key,
             "Rename key": self.rename_key,
-            "Export OTP secret to KeePass": self.export_secret,
+            "Export OTP secret": self.export_secret,
             "Show/hide passcode": self.toggle_passcode_visibility,
             "Set key password": self.set_key_password,
-            "Forget key password": self.forget_key_password,
         }
         while True:
             keys = list(self.config["keys"].items())
@@ -1432,16 +1341,13 @@ class DuoAuthenticator:
                 tuple(actions.values())[choice - 1](name)
 
     def main_menu(self):
-        self.action_menu(
-            "Main menu",
-            {
-                "Passcode screen": self.passcode_screen,
-                "Keys": self.keys_menu,
-                "Vault settings": self.vault_settings,
-            },
-            back="Exit",
-            default=1,
-        )
+        while choice := self.menu(
+            "Main menu", "Passcode screen", "Keys", "Vault settings",
+            back="Exit", default=1, back_value=1,
+        ):
+            if choice == 1:
+                return True
+            (self.keys_menu, self.vault_settings)[choice - 2]()
 
     def close(self):
         lock_file, self.lock_file = self.lock_file, None
@@ -1456,7 +1362,7 @@ class DuoAuthenticator:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Show passcodes and listen for pushes. Press m to open the menu."
+        description="Show passcodes and listen for pushes. Select Main menu for settings."
     )
     options = parser.add_mutually_exclusive_group()
     options.add_argument("-k", dest="key", metavar="KEYNAME", help="print this key's OTP and exit")
