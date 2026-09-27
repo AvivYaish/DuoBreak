@@ -52,21 +52,13 @@ SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**17, 8, 1
 REQUEST_TIMEOUT = (5, 30)
 POLL_SECONDS = 5
 PUSH_ERRORS = (requests.RequestException, ValueError, KeyError, TypeError)
-ACTIVATION_URL = re.compile(
-    r"(?i:https://m-([0-9a-f]+)\.duosecurity\.com)/activate/([A-Za-z0-9_-]+)",
-    re.ASCII,
-)
+ACTIVATION_URL = re.compile(r"(?i:https://m-([0-9a-f]+)\.duosecurity\.com)/activate/([A-Za-z0-9_-]+)", re.ASCII)
 
 
 class EnterInput:
-    """Plain-output events without a reader thread or terminal-mode changes."""
 
     def __init__(self):
-        self.input = None
-        self.pending = deque()
-        self.previous = None
-        self.codes = {}
-        self.step = int(time.time()) // 30
+        self.input, self.pending, self.previous, self.codes, self.step = None, deque(), None, {}, int(time.time()) // 30
         with suppress(OSError, ValueError, AttributeError):
             if sys.stdin.isatty():
                 self.input = create_input()
@@ -108,14 +100,9 @@ class EnterInput:
 
 
 class LiveDisplay:
-    """One redrawable dashboard and input reader for the listening session."""
 
     def __init__(self, title):
-        self.title = title
-        self.codes = {}
-        self.status = ""
-        self.poll_errors = {}
-        self.count = 0
+        self.title, self.codes, self.status, self.poll_errors, self.count = title, {}, "", {}, 0
         self.session = PromptSession(
             output=create_output(),
             input=create_input(),
@@ -167,7 +154,7 @@ class LiveDisplay:
             self.session.key_bindings = None
 
     def _discard_input(self):
-        # Input intended for a previous screen cannot approve a new push.
+        # Input intended for a previous screen shouldn't approve new pushes.
         source = self.session.app.input
         keys = get_typeahead(source) + source.read_keys() + source.flush_keys()
         for key in keys:
@@ -254,9 +241,7 @@ class PasswordStore:
         except PasswordStoreError:
             raise
         except ImportError:
-            raise PasswordStoreError(
-                "Secure storage unavailable, check msal-extensions and your OS keyring."
-            ) from None
+            raise PasswordStoreError("Secure storage unavailable, check msal-extensions and your OS keyring.") from None
         except Exception:
             raise PasswordStoreError("OS secure storage unavailable. Unlock manually.") from None
 
@@ -300,8 +285,6 @@ class PasswordStore:
     def forget(self):
         """Remove the DPAPI blob, replace native-keyring secrets with empty text."""
         if self._platform != "win32":
-            # MSAL has no public keyring deletion API. Clear even without a signal:
-            # a previous save may have stored the secret but failed to create it.
             return self._write("", "clear")
         try:
             self.location.unlink(missing_ok=True)
@@ -381,15 +364,7 @@ class PushListener:
     def __init__(self, keys, poll, interval=5):
         if interval < 0:
             raise ValueError("Polling interval cannot be negative")
-        self._keys = deepcopy(keys)
-        self._poll = poll
-        self._interval = interval
-        self._stop = Event()
-        self._condition = Condition()
-        self._updates = {}
-        self._pending = {}
-        self._threads = []
-        self._started = False
+        self._keys, self._poll, self._interval, self._stop, self._condition, self._updates, self._pending, self._threads, self._started = deepcopy(keys), poll, interval, Event(), Condition(), {}, {}, [], False
 
     def __enter__(self):
         if self._started or self._stop.is_set():
@@ -427,7 +402,7 @@ class PushListener:
                 return
 
     def get(self, timeout=0.25):
-        """Return (key name, latest result), raising queue.Empty on timeout."""
+        """Return (key name, latest result), raise queue.Empty on timeout."""
         with self._condition:
             if not self._condition.wait_for(lambda: self._updates, timeout):
                 raise Empty
@@ -435,7 +410,7 @@ class PushListener:
             return name, self._updates.pop(name)
 
     def is_pending(self, name, urgid):
-        """Check the latest validated snapshot, excluding malformed entries."""
+        """Check the latest validated snapshot, exclude malformed entries."""
         with self._condition:
             return isinstance(urgid, str) and urgid in self._pending.get(name, ())
 
@@ -550,10 +525,7 @@ class DuoAuthenticator:
             name in {".", ".."}
             or name.endswith((".", " "))
             or re.search(r'[<>:"/\\|?*\x00-\x1f]', name)
-            or re.match(
-                r"(?i:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$|conout\$) *(?:\.|$)",
-                name,
-            )
+            or re.match(r"(?i:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$|conout\$) *(?:\.|$)", name)
         ):
             print("Enter a valid filename, without a path.")
             return None
@@ -608,7 +580,7 @@ class DuoAuthenticator:
 
     def decrypt_vault(self, blob, password):
         if not self.valid_vault_header(blob):
-            raise ValueError("Invalid or unsupported vault. Expected DBv2 format.")
+            raise ValueError("Invalid or unsupported vault, expected DBv2 format.")
         key = plaintext = None
         try:
             salt, nonce = blob[4:20], blob[20:36]
@@ -665,7 +637,7 @@ class DuoAuthenticator:
 
             blob = path.read_bytes()
             if not self.valid_vault_header(blob):
-                print("Invalid or unsupported vault. Expected DBv2 format.")
+                print("Invalid or unsupported vault, expected DBv2 format.")
                 return False
             self.vault_digest = hashlib.sha256(blob).digest()
 
@@ -1469,11 +1441,7 @@ class DuoAuthenticator:
             for name, key in keys:
                 response = key.get("response") if isinstance(key, dict) else None
                 organization = response.get("customer_name") if isinstance(response, dict) else None
-                labels.append(
-                    name
-                    + (f" ({organization})" if organization else "")
-                    + (" [hidden]" if passcode_hidden(key) else "")
-                )
+                labels.append(name + (f" ({organization})" if organization else "") + (" [hidden]" if passcode_hidden(key) else ""))
             if not (choice := self.menu("Keys", *labels, default=1)):
                 return
             if choice == 1:
