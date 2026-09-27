@@ -41,7 +41,6 @@ from prompt_toolkit.input import create_input
 from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.output.defaults import create_output
 from prompt_toolkit.shortcuts import choice
 from prompt_toolkit.utils import is_dumb_terminal
@@ -51,8 +50,18 @@ SALT_SIZE = NONCE_SIZE = TAG_SIZE = 16
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**17, 8, 1
 REQUEST_TIMEOUT = (5, 30)
 POLL_SECONDS = 5
+EXIT_KEYS = {Keys.ControlC: KeyboardInterrupt, Keys.ControlD: EOFError, Keys.ControlZ: EOFError}
+PUSH_PATH = "/push/v2/device/transactions"
 PUSH_ERRORS = (requests.RequestException, ValueError, KeyError, TypeError)
 ACTIVATION_URL = re.compile(r"(?i:https://m-([0-9a-f]+)\.duosecurity\.com)/activate/([A-Za-z0-9_-]+)", re.ASCII)
+
+UNSUPPORTED_STORAGE = "Secure storage is unsupported on this OS."
+INVALID_VAULT = "Invalid or unsupported vault, expected DBv2 format."
+VAULT_CHANGED = "Vault was changed by another process"
+INVALID_KEY = "Invalid key data."
+CONNECTION_FAILED = "connection failed"
+LISTENING = "Listening for pushes ({} keys)"
+LISTEN_HINTS = ("- Enter: refresh passcodes", "- m: menu", "- Ctrl+C: stop")
 
 
 class EnterInput:
@@ -72,10 +81,8 @@ class EnterInput:
         while self.pending:
             key = self.pending.popleft().key
             previous, self.previous = self.previous, key
-            if key == Keys.ControlC:
-                raise KeyboardInterrupt
-            if key in (Keys.ControlD, Keys.ControlZ):
-                raise EOFError
+            if error := EXIT_KEYS.get(key):
+                raise error
             if key in ("m", "M"):
                 return "menu"
             if key == Keys.Enter or (key == Keys.ControlJ and previous != Keys.Enter):
@@ -116,11 +123,9 @@ class LiveDisplay:
             f"Vault: {self.title}",
             *passcode_lines(self.codes),
             "",
-            f"Listening for pushes ({self.count} keys)",
+            LISTENING.format(self.count),
+            *(LISTEN_HINTS[-1:] if prompt else LISTEN_HINTS),
         ]
-        if not prompt:
-            rows.extend(("- Enter: refresh passcodes", "- m: menu"))
-        rows.append("- Ctrl+C: stop")
         if self.status:
             rows.extend(("", self.status))
         if self.poll_errors:
@@ -156,12 +161,9 @@ class LiveDisplay:
     def _discard_input(self):
         # Input intended for a previous screen shouldn't approve new pushes.
         source = self.session.app.input
-        keys = get_typeahead(source) + source.read_keys() + source.flush_keys()
-        for key in keys:
-            if key.key == Keys.ControlC:
-                raise KeyboardInterrupt
-            if key.key in (Keys.ControlD, Keys.ControlZ):
-                raise EOFError
+        for key in get_typeahead(source) + source.read_keys() + source.flush_keys():
+            if error := EXIT_KEYS.get(key.key):
+                raise error
         if source.closed:
             raise EOFError
 
@@ -192,7 +194,7 @@ def _local_data_dir(platform):
         if not base.is_absolute():
             base = home / ".local" / "state"
     else:
-        raise PasswordStoreError("Secure storage is unsupported on this OS.")
+        raise PasswordStoreError(UNSUPPORTED_STORAGE)
     if not base.is_absolute():
         raise PasswordStoreError("Password storage requires an absolute path.")
     return base / "DuoBreak" / "passwords"
@@ -234,7 +236,7 @@ class PasswordStore:
                     label="DuoBreak vault password",
                 )
             else:
-                raise PasswordStoreError("Secure storage is unsupported on this OS.")
+                raise PasswordStoreError(UNSUPPORTED_STORAGE)
             if backend.is_encrypted is not True:
                 raise PasswordStoreError("Refusing unencrypted password storage.")
             return backend, persistence.PersistenceNotFound
@@ -443,13 +445,11 @@ class DuoAuthenticator:
             self.display.status = message.strip()
 
     def ask(self, prompt):
-        try:
+        with suppress(EOFError, KeyboardInterrupt):
             read = self.display.ask if self.display is not None else input
             return read(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
-            if self.display is None:
-                print()
-            return None
+        if self.display is None:
+            print()
 
     def confirm(self, prompt, *, default=False):
         answer = self.ask(f"{prompt} [{'Y/n' if default else 'y/N'}]: ")
@@ -468,9 +468,9 @@ class DuoAuthenticator:
             control = event.app.layout.current_control
 
             def position():
-                # Fresh content handles several keystrokes between redraws.
-                content = FormattedTextControl(control.text).create_content(0, 0)
-                return content.cursor_position
+                # Read fresh fragments to handle several keys between redraws.
+                return next(i for i, fragment in enumerate(control.text())
+                            if fragment[0] == "[SetCursorPosition]")
 
             previous = position()
             key = event.key_sequence[-1].key
@@ -482,18 +482,13 @@ class DuoAuthenticator:
                 for _ in options:
                     step.call(event)
 
-        try:
-            return (
-                choice(
-                    title,
-                    options=[*enumerate(options, 1), (0, back)],
-                    default=default or 0,
-                    key_bindings=bindings,
-                )
-                or None
-            )
-        except (EOFError, KeyboardInterrupt):
-            return None
+        with suppress(EOFError, KeyboardInterrupt):
+            return choice(
+                title,
+                options=[*enumerate(options, 1), (0, back)],
+                default=default or 0,
+                key_bindings=bindings,
+            ) or None
 
     def action_menu(self, title, actions, **options):
         callbacks = tuple(actions.values())
@@ -502,7 +497,7 @@ class DuoAuthenticator:
 
     @staticmethod
     def password(prompt, confirm=False, *, min_length=12):
-        try:
+        with suppress(EOFError, KeyboardInterrupt):
             while True:
                 password = getpass.getpass(prompt)
                 if not password or not confirm:
@@ -513,9 +508,7 @@ class DuoAuthenticator:
                 if password == getpass.getpass("Confirm password: "):
                     return password
                 print("Passwords do not match.")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
+        print()
 
     @staticmethod
     def vault_filename(name):
@@ -538,15 +531,12 @@ class DuoAuthenticator:
                 key=lambda path: path.name.lower(),
             )
             if vaults:
-                break
-        if vaults:
-            choice = 1
-            if len(vaults) > 1:
-                choice = self.menu("Vaults", *(path.name for path in vaults), back="Exit")
-            if not choice:
-                return False
-            self.config_file = vaults[choice - 1]
-            return True
+                choice = 1 if len(vaults) == 1 else self.menu(
+                    "Vaults", *(path.name for path in vaults), back="Exit"
+                )
+                if choice:
+                    self.config_file = vaults[choice - 1]
+                return bool(choice)
 
         if not create:
             print("No Duo vault found.")
@@ -580,7 +570,7 @@ class DuoAuthenticator:
 
     def decrypt_vault(self, blob, password):
         if not self.valid_vault_header(blob):
-            raise ValueError("Invalid or unsupported vault, expected DBv2 format.")
+            raise ValueError(INVALID_VAULT)
         key = plaintext = None
         try:
             salt, nonce = blob[4:20], blob[20:36]
@@ -637,7 +627,7 @@ class DuoAuthenticator:
 
             blob = path.read_bytes()
             if not self.valid_vault_header(blob):
-                print("Invalid or unsupported vault, expected DBv2 format.")
+                print(INVALID_VAULT)
                 return False
             self.vault_digest = hashlib.sha256(blob).digest()
 
@@ -669,16 +659,14 @@ class DuoAuthenticator:
                 return True
 
             print("Too many failed password attempts.")
-            return False
         except RuntimeError:
             print("Not enough resources to secure or unlock the vault.")
-            return False
         except (OSError, ValueError):
             print("Could not read or save the encrypted vault.")
-            return False
         finally:
             if not loaded:
                 self.close()
+        return False
 
     def reencrypt_vault(self, password):
         """Commit a fresh encryption key before replacing the unlocked key."""
@@ -686,11 +674,9 @@ class DuoAuthenticator:
         key = self.derive_key(password, salt)
         try:
             self.save_config(key=key, salt=salt)
-        except BaseException:
+            self.salt, self.encryption_key, key = salt, key, self.encryption_key
+        finally:
             self.wipe(key)
-            raise
-        self.wipe(self.encryption_key)
-        self.salt, self.encryption_key = salt, key
 
     def save_config(self, key=None, salt=None):
         if not self.lock_vault():
@@ -716,7 +702,7 @@ class DuoAuthenticator:
             except FileNotFoundError:
                 current_digest = None
             if current_digest != self.vault_digest:
-                raise OSError("Vault was changed by another process")
+                raise OSError(VAULT_CHANGED)
             descriptor, temp_path = tempfile.mkstemp(
                 dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
             )
@@ -759,7 +745,6 @@ class DuoAuthenticator:
             return password
         except (RuntimeError, TypeError):
             print("Could not verify the vault password.")
-            return None
         finally:
             self.wipe(key)
 
@@ -813,7 +798,7 @@ class DuoAuthenticator:
             if lock is None:
                 raise OSError("Destination vault is locked")
             if hashlib.sha256(source.read_bytes()).digest() != self.vault_digest:
-                raise OSError("Vault was changed by another process")
+                raise OSError(VAULT_CHANGED)
             if os.name == "nt":
                 os.rename(source, target)  # Windows refuses an existing target.
             else:
@@ -934,7 +919,6 @@ class DuoAuthenticator:
             return activation, public_key, private_key
         except (requests.RequestException, ValueError, TypeError):
             print("Duo activation failed. Check the code, host, and connection.")
-            return None
 
     def add_key(self):
         print("\nWhen setting up a new Duo device, select Apple iOS tablet.")
@@ -948,10 +932,9 @@ class DuoAuthenticator:
         while url := self.ask("Activation URL (leave empty to cancel): "):
             try:
                 code, host = self.parse_activation_url(url)
+                break
             except ValueError as error:
                 print(f"Invalid Duo activation URL: {error}")
-                continue
-            break
         else:
             return
 
@@ -1030,7 +1013,7 @@ class DuoAuthenticator:
         for kind, detail in (
             (requests.Timeout, "request timed out"),
             (requests.exceptions.SSLError, "TLS connection failed"),
-            (requests.ConnectionError, "connection failed"),
+            (requests.ConnectionError, CONNECTION_FAILED),
             (requests.exceptions.JSONDecodeError, "invalid JSON response"),
             ((ValueError, KeyError, TypeError), "invalid request or response data"),
         ):
@@ -1062,9 +1045,7 @@ class DuoAuthenticator:
         }
 
     def poll_pushes(self, key):
-        return self.duo_request(
-            key, "GET", "/push/v2/device/transactions", self.push_parameters(key)
-        )
+        return self.duo_request(key, "GET", PUSH_PATH, self.push_parameters(key))
 
     @staticmethod
     def push_expired(transaction):
@@ -1154,7 +1135,7 @@ class DuoAuthenticator:
                     reply = self.duo_request(
                         key,
                         "POST",
-                        "/push/v2/device/transactions/" + transaction_id,
+                        f"{PUSH_PATH}/{transaction_id}",
                         reply_data,
                     )
                 except PUSH_ERRORS as error:
@@ -1221,10 +1202,8 @@ class DuoAuthenticator:
                         return "menu" if generate_passcodes else None
                 if self.display is None:
                     print(
-                        f"\nListening for pushes ({len(keys)} keys)",
-                        "- Enter: refresh passcodes",
-                        "- m: menu",
-                        "- Ctrl+C: stop",
+                        "\n" + LISTENING.format(len(keys)),
+                        *LISTEN_HINTS,
                         sep="\n",
                     )
                 while True:
@@ -1253,7 +1232,7 @@ class DuoAuthenticator:
                         detail = self.request_error(error)
                         first_failure = name not in failures
                         failures.add(name)
-                        if detail == "connection failed" and first_failure:
+                        if detail == CONNECTION_FAILED and first_failure:
                             continue  # Retry an isolated connection drop quietly.
                         message = f"[{name}] Mobile push check failed: {detail}, retrying."
                         if poll_errors.get(name) != message:
@@ -1366,7 +1345,7 @@ class DuoAuthenticator:
     def set_key_password(self, name):
         key = self.config["keys"][name]
         if not isinstance(key, dict):
-            print("Invalid key data.")
+            print(INVALID_KEY)
             return
         password = self.password("Key password (blank to cancel): ", confirm=True, min_length=0)
         if password is None:
@@ -1407,7 +1386,7 @@ class DuoAuthenticator:
     def toggle_passcode_visibility(self, name):
         key = self.config["keys"][name]
         if not isinstance(key, dict):
-            print("Invalid key data.")
+            print(INVALID_KEY)
             return
         hidden = not passcode_hidden(key)
         if self.save_changes(self.config["keys"], {name: dict(key, hide_passcode=hidden)}):
