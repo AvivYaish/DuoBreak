@@ -1,6 +1,6 @@
 # LocalDuoStorage
 
-An open-source Python application providing local storage of DuoSecurity authentication credentials with push and passcode support.
+An open-source Python application providing local storage of DuoSecurity authentication credentials.
 
 Supports:
 - Push authorization
