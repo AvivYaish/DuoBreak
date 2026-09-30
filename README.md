@@ -1,12 +1,12 @@
-# DuoBreak
+# LocalDuoStorage
 
-Forked from [JesseNaser's repo](https://github.com/JesseNaser/DuoBreak).
+Forked from [JesseNaser's DuoBreak v2.0.0](https://github.com/JesseNaser/DuoBreak).
 
 Supports:
 - Push authorization
 - Auto-refreshing passcodes
 - Exporting OTP secrets to other programs
-- Securely storing vault password locally
+- Secure local storage of Duo authentication credentials and vault password
 
 <p align="center">
 <img width="400" height="186" alt="Live push notification." src="https://github.com/user-attachments/assets/e6a9cd48-2ad6-4910-a627-c68464010999" /><br/>
