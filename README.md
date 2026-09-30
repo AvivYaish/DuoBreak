@@ -1,6 +1,6 @@
 # LocalDuoStorage
 
-Forked from [JesseNaser's DuoBreak v2.0.0](https://github.com/JesseNaser/DuoBreak).
+An open-source Python application providing local storage of DuoSecurity authentication credentials with push and passcode support.
 
 Supports:
 - Push authorization
@@ -13,6 +13,10 @@ Supports:
 <img width="400" height="271" alt="Live push approved." src="https://github.com/user-attachments/assets/781ac446-734e-4f12-bb9a-2b5f645edea0" /><br/>
 <img width="400" height="199" alt="Secure vault password storage." src="https://github.com/user-attachments/assets/c547a4a8-d039-44db-ac31-96337b93d05b" /><br/>
 </p>
+
+## Acknowledgements
+
+Forked from [JesseNaser's DuoBreak v2.0.0](https://github.com/JesseNaser/DuoBreak).
 
 ## License
 
