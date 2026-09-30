@@ -206,7 +206,7 @@ class PasswordStoreError(RuntimeError):
 class PasswordStore:
     """Lazily use an OS keyring, separate from the original client's storage."""
 
-    service = "DuoBreak vault passwords (keyring)"
+    service = "LocalDuoStorage vault passwords (keyring)"
 
     def __init__(self, vault_path, *, platform=None):
         self._platform = platform or sys.platform
